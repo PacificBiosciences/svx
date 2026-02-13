@@ -1,11 +1,12 @@
 pub mod cli;
 pub mod commands;
+pub mod error;
 
 pub mod core {
     pub mod aligner;
     pub mod svtype;
+    pub mod variant;
     pub mod variant_block;
-    pub mod variant_internal;
     pub mod containers {
         pub mod forest;
         pub mod interval_tree;
@@ -19,6 +20,7 @@ pub mod io {
     pub mod merge_writer;
     pub mod positions_reader;
     pub mod readers;
+    pub mod tpool;
     pub mod vcf_reader;
     pub mod vcf_writer;
 }

@@ -1,15 +1,21 @@
-use crate::core::variant_internal::VariantInternal;
+use crate::{DISTANCE_OFFSET, core::variant::VariantInternal};
 use std::mem;
 
 // Each component may require multiple 64-bit integers to hold its bitset of sample IDs if there are many samples
 // parent[i] - is negative if root, more negative means bigger set; if nonnegative, indicates the parent
-// sample_masks - For each root node, a bitmask of which samples are present in its component
-const SAMPLES_PER_MASK: usize = 63;
+// sample_masks - For each node (only guaranteed current at roots), a bitmask of which samples are present in its component.
+// Stored node-major: sample_masks[node * mask_words + word].
+const SAMPLES_PER_MASK: usize = u64::BITS as usize;
 
 #[derive(Debug)]
 pub struct Forest {
     pub parent: Vec<i32>,
-    pub sample_masks: Vec<Vec<u64>>,
+    pub sample_masks: Vec<u64>,
+    pub mask_words: usize,
+    min_start: Vec<f64>,
+    max_start: Vec<f64>,
+    min_end: Vec<f64>,
+    max_end: Vec<f64>,
     allow_intrasample: bool,
 }
 
@@ -17,21 +23,35 @@ impl Forest {
     pub fn new(variants: &[VariantInternal], allow_intrasample: bool) -> Self {
         let n = variants.len();
         let max_sample = variants.iter().map(|v| v.sample_id).max().unwrap_or(0);
-        let masks_needed = if n == 0 {
+        let mask_words = if n == 0 {
             0
         } else {
             max_sample / SAMPLES_PER_MASK + 1
         };
         let parent = vec![-1; n];
-        let mut sample_masks = vec![vec![0; n]; masks_needed];
+        let mut sample_masks = vec![0u64; n * mask_words];
+        let mut min_start = vec![0.0; n];
+        let mut max_start = vec![0.0; n];
+        let mut min_end = vec![0.0; n];
+        let mut max_end = vec![0.0; n];
         for (i, variant) in variants.iter().enumerate() {
             let mask_id = variant.sample_id / SAMPLES_PER_MASK;
             let bit_position = variant.sample_id % SAMPLES_PER_MASK;
-            sample_masks[mask_id][i] |= 1u64 << bit_position;
+            sample_masks[i * mask_words + mask_id] |= 1u64 << bit_position;
+
+            min_start[i] = variant.start;
+            max_start[i] = variant.start;
+            min_end[i] = variant.end;
+            max_end[i] = variant.end;
         }
         Forest {
             parent,
             sample_masks,
+            mask_words,
+            min_start,
+            max_start,
+            min_end,
+            max_end,
             allow_intrasample,
         }
     }
@@ -53,19 +73,77 @@ impl Forest {
     }
 
     #[inline(always)]
-    pub fn union(&mut self, a: usize, b: usize) {
-        let mut root_a = self.find(a);
-        let mut root_b = self.find(b);
+    fn union_roots_unchecked(&mut self, mut root_a: usize, mut root_b: usize) {
+        debug_assert!(root_a != root_b);
+
+        // Union by size: attach smaller component to larger (more negative) root.
+        if self.parent[root_a] < self.parent[root_b] {
+            mem::swap(&mut root_a, &mut root_b);
+        }
+
+        self.parent[root_b] += self.parent[root_a];
+        self.parent[root_a] = root_b as i32;
+
+        self.min_start[root_b] = self.min_start[root_b].min(self.min_start[root_a]);
+        self.max_start[root_b] = self.max_start[root_b].max(self.max_start[root_a]);
+        self.min_end[root_b] = self.min_end[root_b].min(self.min_end[root_a]);
+        self.max_end[root_b] = self.max_end[root_b].max(self.max_end[root_a]);
+
+        let mask_words = self.mask_words;
+        let a_off = root_a * mask_words;
+        let b_off = root_b * mask_words;
+        for word in 0..mask_words {
+            self.sample_masks[b_off + word] |= self.sample_masks[a_off + word];
+        }
+    }
+
+    #[inline(always)]
+    pub fn union_unchecked(&mut self, a: usize, b: usize) {
+        let root_a = self.find(a);
+        let root_b = self.find(b);
         if root_a != root_b {
-            if self.parent[root_a] < self.parent[root_b] {
-                mem::swap(&mut root_a, &mut root_b);
-            }
-            self.parent[root_b] += self.parent[root_a];
-            self.parent[root_a] = root_b as i32;
-            for masks in &mut self.sample_masks {
-                masks[root_b] |= masks[root_a];
+            self.union_roots_unchecked(root_a, root_b);
+        }
+    }
+
+    fn merged_bbox_diameter(&self, root_a: usize, root_b: usize) -> f64 {
+        let min_start = self.min_start[root_a].min(self.min_start[root_b]);
+        let max_start = self.max_start[root_a].max(self.max_start[root_b]);
+        let min_end = self.min_end[root_a].min(self.min_end[root_b]);
+        let max_end = self.max_end[root_a].max(self.max_end[root_b]);
+
+        let d_start = max_start - min_start;
+        let d_end = max_end - min_end;
+        (d_start * d_start + d_end * d_end).sqrt()
+    }
+
+    #[inline(always)]
+    pub fn try_union(&mut self, a: usize, b: usize) -> bool {
+        self.try_union_with_diameter(a, b, None)
+    }
+
+    #[inline(always)]
+    pub fn try_union_with_diameter(
+        &mut self,
+        a: usize,
+        b: usize,
+        max_diameter: Option<f64>,
+    ) -> bool {
+        let root_a = self.find(a);
+        let root_b = self.find(b);
+        if root_a == root_b {
+            return false;
+        }
+        if !self.valid_edge(root_a, root_b) {
+            return false;
+        }
+        if let Some(max_diameter) = max_diameter {
+            if self.merged_bbox_diameter(root_a, root_b) > max_diameter + DISTANCE_OFFSET {
+                return false;
             }
         }
+        self.union_roots_unchecked(root_a, root_b);
+        true
     }
 
     #[inline(always)]
@@ -80,9 +158,15 @@ impl Forest {
         if self.allow_intrasample {
             return true;
         }
-        self.sample_masks
-            .iter()
-            .all(|mask| (mask[root_a] & mask[root_b]) == 0)
+        let mask_words = self.mask_words;
+        let a_off = root_a * mask_words;
+        let b_off = root_b * mask_words;
+        for word in 0..mask_words {
+            if (self.sample_masks[a_off + word] & self.sample_masks[b_off + word]) != 0 {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -90,75 +174,23 @@ impl Forest {
 mod tests {
     use super::*;
     use crate::core::svtype::SvType;
-    use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
-    use std::time::Instant;
+    use crate::core::variant::test_utils;
+    use proptest::prelude::*;
+    use rand::seq::SliceRandom;
+    use std::collections::HashSet;
 
     pub fn create_variants() -> Vec<VariantInternal> {
-        vec![
-            VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(0, "var2".to_string(), SvType::INSERTION, 1.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(0, "var3".to_string(), SvType::INSERTION, 18.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(1, "var4".to_string(), SvType::INSERTION, 12.0, 7.0)
-                .unwrap(),
-            VariantInternal::from_parts(1, "var5".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(1, "var6".to_string(), SvType::INSERTION, 30.0, 30.0)
-                .unwrap(),
-            VariantInternal::from_parts(1, "var7".to_string(), SvType::INSERTION, 0.0, 0.0)
-                .unwrap(),
-            VariantInternal::from_parts(2, "var8".to_string(), SvType::INSERTION, 12.0, 12.0)
-                .unwrap(),
-            VariantInternal::from_parts(2, "var9".to_string(), SvType::INSERTION, 15.0, 15.0)
-                .unwrap(),
-            VariantInternal::from_parts(2, "var10".to_string(), SvType::INSERTION, 20.0, 20.0)
-                .unwrap(),
-            VariantInternal::from_parts(2, "var11".to_string(), SvType::INSERTION, 28.0, 28.0)
-                .unwrap(),
-            VariantInternal::from_parts(3, "var12".to_string(), SvType::INSERTION, 25.0, 25.0)
-                .unwrap(),
-            VariantInternal::from_parts(4, "var13".to_string(), SvType::INSERTION, 22.0, 22.0)
-                .unwrap(),
-        ]
+        test_utils::insertion_fixture_variants(SvType::INSERTION)
     }
 
     fn create_variants_disjoint() -> Vec<VariantInternal> {
-        vec![
-            VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(1, "var2".to_string(), SvType::INSERTION, 1.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(2, "var3".to_string(), SvType::INSERTION, 18.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(3, "var4".to_string(), SvType::INSERTION, 12.0, 7.0)
-                .unwrap(),
-            VariantInternal::from_parts(4, "var5".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(5, "var6".to_string(), SvType::INSERTION, 30.0, 30.0)
-                .unwrap(),
-            VariantInternal::from_parts(6, "var7".to_string(), SvType::INSERTION, 0.0, 0.0)
-                .unwrap(),
-            VariantInternal::from_parts(7, "var8".to_string(), SvType::INSERTION, 12.0, 12.0)
-                .unwrap(),
-            VariantInternal::from_parts(8, "var9".to_string(), SvType::INSERTION, 15.0, 15.0)
-                .unwrap(),
-            VariantInternal::from_parts(9, "var10".to_string(), SvType::INSERTION, 20.0, 20.0)
-                .unwrap(),
-            VariantInternal::from_parts(10, "var11".to_string(), SvType::INSERTION, 28.0, 28.0)
-                .unwrap(),
-            VariantInternal::from_parts(11, "var12".to_string(), SvType::INSERTION, 25.0, 25.0)
-                .unwrap(),
-            VariantInternal::from_parts(12, "var13".to_string(), SvType::INSERTION, 22.0, 22.0)
-                .unwrap(),
-        ]
+        test_utils::insertion_fixture_variants_disjoint(SvType::INSERTION)
     }
 
     fn create_large_variant_set(num_variants: usize, max_sample_id: usize) -> Vec<VariantInternal> {
         let mut variants: Vec<VariantInternal> = (0..num_variants)
             .map(|i| {
-                VariantInternal::from_parts(
+                test_utils::from_parts(
                     i % max_sample_id,
                     format!("var{}", i),
                     SvType::INSERTION,
@@ -175,28 +207,272 @@ mod tests {
         variants
     }
 
-    fn create_variant_set(
-        num_variants: usize,
-        max_sample_id: usize,
-        seed: u64,
-    ) -> Vec<VariantInternal> {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut variants: Vec<VariantInternal> = (0..num_variants)
-            .map(|i| {
-                VariantInternal::from_parts(
-                    rng.random_range(0..max_sample_id),
-                    format!("var{}", i),
-                    SvType::INSERTION,
-                    1.0,
-                    1.0,
-                )
-                .unwrap()
+    fn variants_from_sample_ids(sample_ids: &[usize]) -> Vec<VariantInternal> {
+        sample_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &sample_id)| {
+                test_utils::from_parts(sample_id, format!("var{}", i), SvType::INSERTION, 1.0, 1.0)
+                    .unwrap()
             })
-            .collect();
+            .collect()
+    }
 
-        variants.shuffle(&mut rng);
+    fn boundary_sample_id_strategy() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            Just(0usize),
+            Just(SAMPLES_PER_MASK.saturating_sub(1)),
+            Just(SAMPLES_PER_MASK),
+            Just(SAMPLES_PER_MASK * 2 - 1),
+            Just(SAMPLES_PER_MASK * 2),
+            Just(SAMPLES_PER_MASK * 64),
+        ]
+    }
 
-        variants
+    fn sample_id_strategy() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            8 => 0usize..(SAMPLES_PER_MASK * 10),
+            2 => boundary_sample_id_strategy(),
+        ]
+    }
+
+    fn nonempty_sample_ids_strategy() -> impl Strategy<Value = Vec<usize>> {
+        (
+            proptest::collection::vec(sample_id_strategy(), 0..64),
+            boundary_sample_id_strategy(),
+        )
+            .prop_map(|(mut sample_ids, boundary)| {
+                sample_ids.push(boundary);
+                sample_ids
+            })
+    }
+
+    fn union_case_strategy() -> impl Strategy<Value = (Vec<usize>, Vec<(usize, usize)>)> {
+        nonempty_sample_ids_strategy().prop_flat_map(|sample_ids| {
+            let n = sample_ids.len();
+            let ops = proptest::collection::vec((0..n, 0..n), 0..256);
+            (Just(sample_ids), ops)
+        })
+    }
+
+    #[derive(Debug)]
+    struct ModelForest {
+        parent: Vec<usize>,
+        size: Vec<usize>,
+        samples: Vec<HashSet<usize>>,
+        allow_intrasample: bool,
+    }
+
+    impl ModelForest {
+        fn new(sample_ids: &[usize], allow_intrasample: bool) -> Self {
+            let n = sample_ids.len();
+            let parent = (0..n).collect();
+            let size = vec![1usize; n];
+            let samples = sample_ids
+                .iter()
+                .map(|&sample_id| HashSet::from([sample_id]))
+                .collect();
+            Self {
+                parent,
+                size,
+                samples,
+                allow_intrasample,
+            }
+        }
+
+        fn find(&mut self, x: usize) -> usize {
+            let mut root = x;
+            while self.parent[root] != root {
+                root = self.parent[root];
+            }
+
+            let mut current = x;
+            while self.parent[current] != current {
+                let next = self.parent[current];
+                self.parent[current] = root;
+                current = next;
+            }
+            root
+        }
+
+        fn try_union(&mut self, a: usize, b: usize) -> bool {
+            let mut root_a = self.find(a);
+            let mut root_b = self.find(b);
+            if root_a == root_b {
+                return false;
+            }
+
+            if !self.allow_intrasample && !self.samples[root_a].is_disjoint(&self.samples[root_b]) {
+                return false;
+            }
+
+            // Union by size.
+            if self.size[root_a] < self.size[root_b] {
+                mem::swap(&mut root_a, &mut root_b);
+            }
+
+            self.parent[root_b] = root_a;
+            self.size[root_a] += self.size[root_b];
+
+            let merged = mem::take(&mut self.samples[root_b]);
+            self.samples[root_a].extend(merged);
+            true
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_forest_init_sets_expected_bits(sample_ids in nonempty_sample_ids_strategy()) {
+            let variants = variants_from_sample_ids(&sample_ids);
+            let f = Forest::new(&variants, false);
+
+            let n = sample_ids.len();
+            prop_assert_eq!(f.parent, vec![-1; n]);
+
+            let max_sample_id = sample_ids.iter().copied().max().unwrap_or(0);
+            let expected_mask_words = max_sample_id / SAMPLES_PER_MASK + 1;
+            prop_assert_eq!(f.mask_words, expected_mask_words);
+            prop_assert_eq!(f.sample_masks.len(), expected_mask_words * n);
+
+            for (i, &sample_id) in sample_ids.iter().enumerate() {
+                let mask_id = sample_id / SAMPLES_PER_MASK;
+                let bit_position = sample_id % SAMPLES_PER_MASK;
+                for m in 0..expected_mask_words {
+                    let expected = if m == mask_id {
+                        1u64 << bit_position
+                    } else {
+                        0u64
+                    };
+                    prop_assert_eq!(f.sample_masks[i * expected_mask_words + m], expected);
+                }
+            }
+        }
+
+        #[test]
+        fn prop_forest_union_find_invariants(
+            allow_intrasample in any::<bool>(),
+            (sample_ids, ops) in union_case_strategy(),
+        ) {
+            let variants = variants_from_sample_ids(&sample_ids);
+            let mut f = Forest::new(&variants, allow_intrasample);
+
+            for (a, b) in ops {
+                if a == b {
+                    continue;
+                }
+                let _ = f.try_union(a, b);
+            }
+
+            let n = sample_ids.len();
+            let mask_words = f.mask_words;
+
+            // Force path compression and collect each node's root.
+            let mut roots = vec![0usize; n];
+            for (i, root) in roots.iter_mut().enumerate() {
+                *root = f.find(i);
+            }
+
+            // Compute expected component sizes and sample masks from the final partition.
+            let mut counts = vec![0usize; n];
+            let mut expected_masks = vec![0u64; n * mask_words];
+            for (i, &sample_id) in sample_ids.iter().enumerate() {
+                let root = roots[i];
+                counts[root] += 1;
+                let mask_id = sample_id / SAMPLES_PER_MASK;
+                let bit_position = sample_id % SAMPLES_PER_MASK;
+                expected_masks[root * mask_words + mask_id] |= 1u64 << bit_position;
+            }
+
+            // Roots store negative size; sample masks are only guaranteed to be current at roots.
+            for (i, parent) in f.parent.iter().enumerate() {
+                if *parent < 0 {
+                    prop_assert_eq!((-*parent) as usize, counts[i]);
+                    let off = i * mask_words;
+                    for word in 0..mask_words {
+                        prop_assert_eq!(
+                            f.sample_masks[off + word],
+                            expected_masks[off + word]
+                        );
+                    }
+
+                    if !allow_intrasample {
+                        let distinct_samples: usize = expected_masks[off..off + mask_words]
+                            .iter()
+                            .map(|m| m.count_ones() as usize)
+                            .sum();
+                        prop_assert_eq!(distinct_samples, counts[i]);
+                    }
+                } else {
+                    prop_assert!((*parent as usize) < n);
+                }
+            }
+
+            // After one `find` per node, all non-roots should point directly at their root.
+            for (i, &root) in roots.iter().enumerate() {
+                if i != root {
+                    prop_assert_eq!(f.parent[i], root as i32);
+                }
+                prop_assert!(f.parent[root] < 0);
+            }
+
+            // `can_union` should match the intended semantics for all pairs.
+            for a in 0..n {
+                for b in 0..n {
+                    if a == b {
+                        continue;
+                    }
+                    let ra = roots[a];
+                    let rb = roots[b];
+                    let expected = if ra == rb {
+                        false
+                    } else if allow_intrasample {
+                        true
+                    } else {
+                        let a_off = ra * mask_words;
+                        let b_off = rb * mask_words;
+                        (0..mask_words).all(|word| {
+                            (expected_masks[a_off + word] & expected_masks[b_off + word]) == 0
+                        })
+                    };
+
+                    prop_assert_eq!(f.can_union(a, b), expected);
+                    prop_assert_eq!(f.can_union(b, a), expected);
+                }
+            }
+        }
+
+        #[test]
+        fn prop_forest_try_union_return_matches_model(
+            allow_intrasample in any::<bool>(),
+            (sample_ids, ops) in union_case_strategy(),
+        ) {
+            let variants = variants_from_sample_ids(&sample_ids);
+            let mut f = Forest::new(&variants, allow_intrasample);
+            let mut model = ModelForest::new(&sample_ids, allow_intrasample);
+
+            for (a, b) in ops {
+                let expected = model.try_union(a, b);
+                let got = f.try_union(a, b);
+                prop_assert_eq!(got, expected);
+            }
+
+            let n = sample_ids.len();
+            let mut f_roots = vec![0usize; n];
+            for (i, root) in f_roots.iter_mut().enumerate() {
+                *root = f.find(i);
+            }
+
+            let mut model_roots = vec![0usize; n];
+            for (i, root) in model_roots.iter_mut().enumerate() {
+                *root = model.find(i);
+            }
+
+            for i in 0..n {
+                for j in 0..n {
+                    prop_assert_eq!(f_roots[i] == f_roots[j], model_roots[i] == model_roots[j]);
+                }
+            }
+        }
     }
 
     #[test]
@@ -208,15 +484,15 @@ mod tests {
         assert_eq!(f.parent, vec![-1; variants.len()]);
 
         let max_sample_id = 4;
-        let masks_needed = max_sample_id / SAMPLES_PER_MASK + 1;
-        assert_eq!(f.sample_masks.len(), masks_needed);
+        let expected_mask_words = max_sample_id / SAMPLES_PER_MASK + 1;
+        assert_eq!(f.mask_words, expected_mask_words);
 
-        assert_eq!(f.sample_masks[0][0], 0b1);
-        assert_eq!(f.sample_masks[0][1], 0b1);
-        assert_eq!(f.sample_masks[0][3], 0b10);
-        assert_eq!(f.sample_masks[0][7], 0b100);
-        assert_eq!(f.sample_masks[0][11], 0b1000);
-        assert_eq!(f.sample_masks[0][12], 0b10000);
+        assert_eq!(f.sample_masks[0], 0b1);
+        assert_eq!(f.sample_masks[expected_mask_words], 0b1);
+        assert_eq!(f.sample_masks[3 * expected_mask_words], 0b10);
+        assert_eq!(f.sample_masks[7 * expected_mask_words], 0b100);
+        assert_eq!(f.sample_masks[11 * expected_mask_words], 0b1000);
+        assert_eq!(f.sample_masks[12 * expected_mask_words], 0b10000);
     }
 
     #[test]
@@ -225,92 +501,6 @@ mod tests {
         let f = Forest::new(&variants, false);
         assert_eq!(f.parent.len(), 0);
         assert_eq!(f.sample_masks.len(), 0);
-    }
-
-    #[test]
-    fn test_forest_init_single_variant() {
-        let variant =
-            vec![
-                VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                    .unwrap(),
-            ];
-        let f = Forest::new(&variant, false);
-
-        assert_eq!(f.parent.len(), 1);
-        assert_eq!(f.parent, vec![-1; 1]);
-        assert_eq!(f.sample_masks.len(), 1);
-        assert_eq!(f.sample_masks[0][0], 0b1);
-    }
-
-    #[test]
-    fn test_forest_init_same_sample_id() {
-        let variants = vec![
-            VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(0, "var2".to_string(), SvType::INSERTION, 20.0, 10.0)
-                .unwrap(),
-        ];
-        let f = Forest::new(&variants, false);
-
-        assert_eq!(f.parent.len(), 2);
-        assert_eq!(f.parent, vec![-1; 2]);
-        assert_eq!(f.sample_masks.len(), 1);
-        assert_eq!(f.sample_masks[0][0], 0b1);
-        assert_eq!(f.sample_masks[0][1], 0b1);
-    }
-
-    #[test]
-    fn test_forest_init_max_sample_id() {
-        let sample_id = SAMPLES_PER_MASK * 64;
-        let variant = vec![VariantInternal::from_parts(
-            sample_id,
-            "var1".to_string(),
-            SvType::INSERTION,
-            10.0,
-            5.0,
-        )
-        .unwrap()];
-        let f = Forest::new(&variant, false);
-
-        assert_eq!(f.parent.len(), 1);
-        assert_eq!(f.parent, vec![-1; 1]);
-        assert_eq!(f.sample_masks.len(), 65);
-        assert_eq!(f.sample_masks[64][0], 0b1);
-    }
-
-    #[test]
-    fn test_forest_init_boundary_condition() {
-        let sample_id = SAMPLES_PER_MASK - 1;
-        let variant = vec![VariantInternal::from_parts(
-            sample_id,
-            "var1".to_string(),
-            SvType::INSERTION,
-            10.0,
-            5.0,
-        )
-        .unwrap()];
-        let f = Forest::new(&variant, false);
-
-        assert_eq!(f.parent.len(), 1);
-        assert_eq!(f.parent, vec![-1; 1]);
-        assert_eq!(f.sample_masks.len(), 1);
-        assert_eq!(f.sample_masks[0][0], 1 << (SAMPLES_PER_MASK - 1));
-    }
-
-    #[test]
-    fn test_forest_large_init() {
-        let num_variants = 1000;
-        let max_sample_id = 512;
-        let variants = create_large_variant_set(num_variants, max_sample_id);
-        let f = Forest::new(&variants, false);
-        assert_eq!(f.parent.len(), num_variants);
-        let masks_needed = max_sample_id / SAMPLES_PER_MASK + 1;
-        assert_eq!(f.sample_masks.len(), masks_needed);
-        for (i, variant) in variants.iter().enumerate() {
-            let mask_id = variant.sample_id / SAMPLES_PER_MASK;
-            let bit_position = variant.sample_id % SAMPLES_PER_MASK;
-            assert_eq!(f.sample_masks[mask_id][i], 1 << bit_position);
-        }
     }
 
     #[test]
@@ -334,72 +524,20 @@ mod tests {
     #[test]
     fn test_union_two_distinct_components() {
         let variants = vec![
-            VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(1, "var2".to_string(), SvType::INSERTION, 15.0, 10.0)
-                .unwrap(),
+            test_utils::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0).unwrap(),
+            test_utils::from_parts(1, "var2".to_string(), SvType::INSERTION, 15.0, 10.0).unwrap(),
         ];
         let mut f = Forest::new(&variants, false);
         assert!(f.can_union(0, 1));
         assert!(f.can_union(1, 0));
-        f.union(0, 1);
+        f.union_unchecked(0, 1);
         assert!(!f.can_union(0, 1));
         assert!(!f.can_union(1, 0));
         assert_eq!(f.find(0), 1);
         assert_eq!(f.find(1), 1);
 
-        assert_eq!(f.sample_masks, vec![vec![1, 3]]);
+        assert_eq!(f.sample_masks, vec![1, 3]);
         assert_eq!(f.parent, vec![1, -2]);
-    }
-
-    #[test]
-    fn test_union_boundary_condition() {
-        let sample_id = SAMPLES_PER_MASK - 1;
-        let variant = vec![
-            VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(
-                sample_id,
-                "var2".to_string(),
-                SvType::INSERTION,
-                10.0,
-                5.0,
-            )
-            .unwrap(),
-        ];
-        let mut f = Forest::new(&variant, false);
-        assert!(f.can_union(0, 1));
-        assert!(f.can_union(1, 0));
-        f.union(0, 1);
-        assert!(!f.can_union(0, 1));
-        assert!(!f.can_union(1, 0));
-        assert_eq!(f.find(0), 1);
-        assert_eq!(f.find(1), 1);
-    }
-
-    #[test]
-    fn test_union_max_samples() {
-        let sample_id = SAMPLES_PER_MASK * 64;
-        let variant = vec![
-            VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(
-                sample_id,
-                "var2".to_string(),
-                SvType::INSERTION,
-                10.0,
-                5.0,
-            )
-            .unwrap(),
-        ];
-        let mut f = Forest::new(&variant, false);
-        assert!(f.can_union(1, 0));
-        assert!(f.can_union(0, 1));
-        f.union(1, 0);
-        assert!(!f.can_union(1, 0));
-        assert!(!f.can_union(0, 1));
-        assert_eq!(f.find(0), 0);
-        assert_eq!(f.find(1), 0);
     }
 
     #[test]
@@ -407,23 +545,20 @@ mod tests {
         let variants = create_variants();
         let mut f = Forest::new(&variants, false);
 
-        f.union(0, 1);
+        f.union_unchecked(0, 1);
         assert_eq!(f.find(0), f.find(1));
 
-        f.union(1, 2);
+        f.union_unchecked(1, 2);
         assert_eq!(f.find(0), f.find(2));
         assert_eq!(f.find(1), f.find(2));
 
-        f.union(3, 4);
+        f.union_unchecked(3, 4);
         assert_eq!(f.find(3), f.find(4));
 
-        f.union(0, 3);
+        f.union_unchecked(0, 3);
         assert_eq!(f.find(0), f.find(4));
 
-        assert_eq!(
-            f.sample_masks,
-            vec![vec![1, 3, 1, 2, 2, 2, 2, 4, 4, 4, 4, 8, 16]]
-        );
+        assert_eq!(f.sample_masks, vec![1, 3, 1, 2, 2, 2, 2, 4, 4, 4, 4, 8, 16]);
 
         assert_eq!(
             f.parent,
@@ -433,15 +568,13 @@ mod tests {
         // Connect everything where allowed by sample ids
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
-                if f.can_union(i, j) {
-                    f.union(i, j);
-                }
+                let _ = f.try_union(i, j);
             }
         }
 
         assert_eq!(
             f.sample_masks,
-            vec![vec![1, 31, 1, 2, 2, 2, 2, 4, 6, 6, 4, 8, 16]]
+            vec![1, 31, 1, 2, 2, 2, 2, 4, 6, 6, 4, 8, 16]
         );
 
         assert_eq!(f.parent, vec![1, -8, 1, 1, 1, 8, 9, 1, -2, -2, -1, 1, 1]);
@@ -449,7 +582,7 @@ mod tests {
         // Connect everything regardless of sample_id
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
-                f.union(i, j);
+                f.union_unchecked(i, j);
             }
         }
 
@@ -457,364 +590,24 @@ mod tests {
     }
 
     #[test]
-    fn test_forest_union_find_random_sample_ids() {
-        let variants = create_variant_set(100, 10, 42);
-
-        let mut f = Forest::new(&variants, false);
-
-        assert!(f.can_union(0, 1));
-        f.union(0, 1);
-        assert_eq!(f.find(0), f.find(1));
-
-        for i in (10..90).skip(2) {
-            if f.can_union(i, i + 2) {
-                f.union(i, i + 2);
-            }
-        }
-
-        assert_eq!(
-            f.sample_masks,
-            vec![vec![
-                64, 65, 64, 256, 256, 8, 16, 1, 4, 32, 16, 8, 32, 16, 48, 528, 16, 512, 146, 513,
-                2, 1, 2, 901, 2, 256, 1015, 4, 512, 512, 64, 512, 128, 866, 256, 2, 1, 64, 32, 32,
-                16, 2, 64, 262, 594, 256, 16, 256, 512, 257, 16, 256, 560, 377, 512, 1, 512, 8,
-                820, 64, 256, 16, 32, 1, 16, 11, 256, 8, 352, 8, 32, 153, 256, 128, 352, 1, 32, 1,
-                32, 27, 96, 16, 32, 2, 313, 2, 16, 262, 8, 4, 1, 256, 16, 64, 4, 512, 32, 256, 8,
-                16,
-            ]]
-        );
-
-        assert_eq!(
-            f.parent,
-            vec![
-                1, -2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 14, 15, -2, -2, 18, 19, -3, -2, 18,
-                23, -1, -5, 26, 23, -9, 23, 26, 23, 26, 33, 26, -5, 26, 33, 26, 33, 26, 33, 26, 43,
-                44, -3, -4, 43, 44, 49, 44, -2, 52, 53, -3, -6, 52, 53, 58, 53, -5, 53, 58, 53, 58,
-                65, 58, -3, 68, 65, -3, 71, 68, -4, 74, 71, -3, 71, 74, 79, 80, -4, -2, 79, 84, 79,
-                -5, 87, 84, -3, 84, 87, 84, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            ]
-        );
-
-        for i in (1..97).skip(3) {
-            if f.can_union(i, i + 3) {
-                f.union(i, i + 3);
-            }
-        }
-
-        assert_eq!(
-            f.sample_masks,
-            vec![vec![
-                64, 65, 64, 256, 256, 8, 16, 273, 12, 48, 16, 8, 32, 16, 571, 528, 16, 512, 146,
-                513, 2, 1, 2, 901, 2, 256, 1015, 4, 512, 512, 64, 512, 128, 866, 256, 2, 1, 64, 32,
-                32, 16, 2, 64, 262, 851, 256, 16, 256, 512, 257, 16, 256, 560, 377, 512, 1, 512, 8,
-                831, 64, 256, 16, 32, 1, 16, 11, 256, 8, 352, 8, 32, 505, 256, 128, 352, 1, 32, 1,
-                32, 379, 96, 16, 32, 2, 377, 2, 16, 798, 8, 4, 1, 256, 16, 64, 260, 512, 32, 256,
-                8, 48,
-            ]]
-        );
-
-        assert_eq!(
-            f.parent,
-            vec![
-                1, -2, -1, -1, 7, 8, 9, -3, -2, -2, 7, 14, 14, 15, -6, -2, 18, 14, -3, 14, 18, 23,
-                14, -5, 26, 23, -9, 23, 26, 23, 26, 33, 26, -5, 26, 33, 26, 33, 26, 33, 26, 43, 44,
-                -3, -6, 43, 44, 44, 44, 44, 52, 53, -3, -6, 52, 53, 58, 53, -8, 53, 58, 53, 58, 58,
-                58, 58, 68, 58, 71, 71, 71, -7, 74, 71, 79, 71, 79, 79, 80, -7, -2, 79, 84, 79, -6,
-                87, 84, -6, 84, 87, 84, 94, 87, 84, -2, 87, 99, -1, 87, -2,
-            ]
-        );
-
-        for i in 0..variants.len() {
-            for j in (i + 1)..variants.len() {
-                if f.can_union(i, j) {
-                    f.union(i, j);
-                }
-            }
-        }
-
-        assert_eq!(
-            f.sample_masks,
-            vec![vec![
-                64, 381, 64, 256, 256, 8, 16, 337, 12, 48, 16, 8, 32, 16, 831, 528, 16, 512, 402,
-                513, 2, 1, 2, 949, 2, 256, 1015, 4, 512, 512, 64, 512, 128, 866, 256, 2, 1, 64, 32,
-                32, 16, 2, 64, 886, 851, 256, 16, 256, 512, 257, 16, 256, 560, 377, 512, 1, 512, 8,
-                831, 64, 256, 16, 32, 1, 16, 11, 256, 8, 352, 8, 32, 505, 256, 128, 352, 1, 32, 1,
-                32, 379, 96, 16, 32, 2, 377, 2, 16, 798, 8, 4, 1, 256, 16, 64, 260, 512, 32, 256,
-                8, 48,
-            ]]
-        );
-
-        assert_eq!(
-            f.parent,
-            vec![
-                1, -7, 7, 1, 7, 1, 1, -4, 1, 1, 7, 14, 14, 43, -8, 43, 18, 14, -4, 14, 18, 23, 14,
-                -7, 26, 23, -9, 23, 26, 23, 26, 33, 26, -5, 26, 33, 26, 33, 26, 33, 26, 43, 44, -7,
-                -6, 43, 44, 44, 44, 44, 52, 53, -3, -6, 52, 53, 58, 53, -8, 53, 58, 53, 58, 58, 58,
-                58, 71, 58, 71, 71, 71, -7, 79, 71, 79, 71, 79, 79, 43, -7, 43, 79, 84, 79, -6, 87,
-                84, -6, 84, 87, 84, 14, 87, 84, 14, 87, 23, 18, 87, 23,
-            ]
-        );
-
-        for i in 0..variants.len() {
-            for j in (i + 1)..variants.len() {
-                f.union(i, j);
-            }
-        }
-
-        assert_eq!(
-            f.parent,
-            vec![
-                1, -100, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_forest_union_find_random_sample_ids_large_sample_ids() {
-        let variants = create_variant_set(100, SAMPLES_PER_MASK * 2, 42);
-        let mut f = Forest::new(&variants, false);
-
-        for i in 0..variants.len() {
-            for j in (i + 1)..variants.len() {
-                if f.can_union(i, j) {
-                    f.union(i, j);
-                }
-            }
-        }
-
-        assert_eq!(
-            f.sample_masks,
-            vec![
-                vec![
-                    0,
-                    8592754029918624219,
-                    0,
-                    0,
-                    0,
-                    140737488355328,
-                    4611686018427387904,
-                    2048,
-                    2147483648,
-                    0,
-                    288230376151711744,
-                    17592186044416,
-                    0,
-                    144115188075855872,
-                    4503599627370496,
-                    0,
-                    72057594037927936,
-                    0,
-                    0,
-                    256,
-                    131072,
-                    64,
-                    8388608,
-                    0,
-                    16777216,
-                    0,
-                    2147483648,
-                    33554432,
-                    0,
-                    4914007737883623441,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    131072,
-                    8,
-                    0,
-                    0,
-                    0,
-                    2251799813685248,
-                    1048576,
-                    0,
-                    8589934592,
-                    524288,
-                    0,
-                    1152921504606846976,
-                    0,
-                    0,
-                    2,
-                    9007199254740992,
-                    0,
-                    0,
-                    0,
-                    0,
-                    1,
-                    0,
-                    562949953421312,
-                    4294967296,
-                    0,
-                    0,
-                    9007199254740992,
-                    0,
-                    128,
-                    1125899906842624,
-                    1048576,
-                    0,
-                    274877906944,
-                    0,
-                    17592186044416,
-                    0,
-                    4503599627370496,
-                    0,
-                    0,
-                    9007199254740992,
-                    4096,
-                    0,
-                    16,
-                    0,
-                    562949953421312,
-                    0,
-                    288230376151711744,
-                    0,
-                    65536,
-                    0,
-                    65536,
-                    2305843009213693952,
-                    0,
-                    8796093022208,
-                    134217728,
-                    16,
-                    0,
-                    4611686018427387904,
-                    0,
-                    134217728,
-                    0,
-                    0,
-                    0,
-                    281474976710656,
-                    9007199254740992,
-                ],
-                vec![
-                    131072,
-                    4134825489604769325,
-                    262144,
-                    70368744177664,
-                    8796093022208,
-                    0,
-                    0,
-                    0,
-                    0,
-                    8,
-                    0,
-                    0,
-                    4096,
-                    0,
-                    0,
-                    2305843009213693952,
-                    0,
-                    576460752303423488,
-                    137438953472,
-                    0,
-                    0,
-                    0,
-                    0,
-                    536870912,
-                    0,
-                    1099511627776,
-                    0,
-                    0,
-                    18014398509481984,
-                    2900689107762417701,
-                    65536,
-                    2305843009213693952,
-                    67108864,
-                    70368744177664,
-                    274877906944,
-                    0,
-                    0,
-                    16384,
-                    512,
-                    1,
-                    0,
-                    0,
-                    8192,
-                    0,
-                    0,
-                    17592186044416,
-                    0,
-                    281474976710656,
-                    9007199254740992,
-                    0,
-                    0,
-                    274877906944,
-                    4,
-                    1024,
-                    1152921504606846976,
-                    0,
-                    18014398509481984,
-                    0,
-                    0,
-                    131072,
-                    70368744177664,
-                    0,
-                    4096,
-                    0,
-                    0,
-                    0,
-                    140737488355328,
-                    0,
-                    262144,
-                    0,
-                    4,
-                    0,
-                    17592186044416,
-                    137438953472,
-                    70368744439812,
-                    0,
-                    4,
-                    0,
-                    32,
-                    0,
-                    1048576,
-                    0,
-                    1,
-                    0,
-                    281474976710656,
-                    0,
-                    0,
-                    549755813888,
-                    0,
-                    0,
-                    0,
-                    1099511627776,
-                    0,
-                    524288,
-                    0,
-                    72057594037927936,
-                    32,
-                    70368744177664,
-                    0,
-                    0,
-                ],
-            ]
-        )
-    }
-
-    #[test]
     fn test_forest_union_find_large() {
         let variants = create_large_variant_set(1000, 200);
         let mut f = Forest::new(&variants, false);
 
-        f.union(0, 1);
+        f.union_unchecked(0, 1);
         assert_eq!(f.find(0), f.find(1));
 
-        f.union(1, 2);
+        f.union_unchecked(1, 2);
         assert_eq!(f.find(0), f.find(2));
         assert_eq!(f.find(1), f.find(2));
 
-        f.union(3, 4);
+        f.union_unchecked(3, 4);
         assert_eq!(f.find(3), f.find(4));
 
-        f.union(0, 900);
+        f.union_unchecked(0, 900);
         assert_eq!(f.find(0), f.find(900));
 
-        f.union(500, 501);
+        f.union_unchecked(500, 501);
         assert_eq!(f.find(500), f.find(501));
     }
 
@@ -826,13 +619,13 @@ mod tests {
 
         // Any two variants can be unioned
         assert!(f.can_union(0, 1));
-        f.union(0, 1);
+        f.union_unchecked(0, 1);
         assert!(!f.can_union(0, 1)); // Already unioned, cannot union again
-        f.union(1, 2);
+        f.union_unchecked(1, 2);
         assert!(!f.can_union(0, 2)); // All three are connected
-        f.union(3, 4);
+        f.union_unchecked(3, 4);
         assert!(f.can_union(0, 3)); // 0 and 3 are still separate, can be unioned
-        f.union(0, 3);
+        f.union_unchecked(0, 3);
         assert!(!f.can_union(0, 4)); // All are now connected
     }
 
@@ -841,14 +634,15 @@ mod tests {
         let variants = create_variants_disjoint();
         let mut f = Forest::new(&variants, false);
 
-        f.union(0, 1);
-        f.union(2, 3);
+        f.union_unchecked(0, 1);
+        f.union_unchecked(2, 3);
         assert!(f.can_union(0, 2));
 
         // Modify the sample mask directly to simulate an invalid state
         let i = f.find(2);
         let j = f.find(0);
-        f.sample_masks[0][i] |= f.sample_masks[0][j];
+        let mask_words = f.mask_words;
+        f.sample_masks[i * mask_words] |= f.sample_masks[j * mask_words];
         // Invalid union due to overlapping masks
         assert!(!f.can_union(0, 2));
     }
@@ -859,7 +653,7 @@ mod tests {
         let mut f = Forest::new(&variants, false);
 
         for i in 1..variants.len() {
-            f.union(0, i);
+            f.union_unchecked(0, i);
         }
 
         for i in 1..variants.len() {
@@ -872,45 +666,25 @@ mod tests {
         let variants = create_large_variant_set(63, 63);
         let mut f = Forest::new(&variants, false);
 
-        f.union(0, 1);
-        f.union(2, 3);
-        f.union(0, 2);
+        f.union_unchecked(0, 1);
+        f.union_unchecked(2, 3);
+        f.union_unchecked(0, 2);
 
         let root = f.find(0);
-        let expected_mask = f.sample_masks[0][root];
+        let mask_words = f.mask_words;
+        let expected_mask = f.sample_masks[root * mask_words];
 
         for i in 0..4 {
             let x = f.find(i);
-            assert_eq!(f.sample_masks[0][x], expected_mask);
+            assert_eq!(f.sample_masks[x * mask_words], expected_mask);
         }
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[ignore = "Benchmark test"]
-    fn test_union_find_timing() {
-        let num_variants = 5000;
-        let max_sample_id = 1000;
-        let variants = create_variant_set(num_variants, max_sample_id, 42);
-        let mut f = Forest::new(&variants, false);
-
-        let t0 = Instant::now();
-        for i in 0..num_variants / 2 {
-            if f.can_union(i, num_variants - 1 - i) {
-                f.union(i, num_variants - 1 - i);
-            }
-        }
-        let duration = t0.elapsed();
-        println!("Duration: {:?}", duration);
     }
 
     #[test]
     fn test_forest_allow_intrasample_true() {
         let variants = vec![
-            VariantInternal::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0)
-                .unwrap(),
-            VariantInternal::from_parts(0, "var2".to_string(), SvType::INSERTION, 20.0, 10.0)
-                .unwrap(),
+            test_utils::from_parts(0, "var1".to_string(), SvType::INSERTION, 10.0, 5.0).unwrap(),
+            test_utils::from_parts(0, "var2".to_string(), SvType::INSERTION, 20.0, 10.0).unwrap(),
         ];
 
         let mut f_allow_true = Forest::new(&variants, true);

@@ -1,0 +1,47 @@
+# SVX merge defaults as TOML config (baseline behavior).
+# Keep input/output paths on CLI:
+#   --vcf / --vcf-list and -o / --output
+
+# Input annotations
+# trs = "catalog.bed"                 
+
+# Performance
+# threads = 8
+# io_threads = 2
+
+# Output/diagnostics/selection flags
+print_header = false
+no_progress = false
+force_single = false
+no_version = false
+# contig = ["chr1", "chr2"]           
+# target_positions = ["(chr1:1000)"] 
+svtype = ["ALL"]
+# dump_path = "merge_diagnostics.tsv"
+
+# Distance thresholds
+max_dist = 850
+min_dist = 100
+min_sequence_similarity = 0.85
+min_size_similarity = 0.20
+max_dist_linear = 0.4
+disable_linear_threshold = false
+min_reciprocal_overlap = 0.10
+
+# Clustering
+knn_search_k = 8
+no_shard = false
+min_shard_size = 0
+allow_intrasample = false
+no_mutual_distance = false
+merge_constraint = "clique"
+
+# Tandem repeats
+filter_tr_contained = false
+tr_span_query_slop = 0
+tr_min_span_containment = 800000
+tr_min_span_overlap_bp = 1
+tr_ins_max_dist = 0
+tr_max_dist = 4000
+tr_min_sequence_similarity = 0.6
+tr_min_recip_overlap = 0.0

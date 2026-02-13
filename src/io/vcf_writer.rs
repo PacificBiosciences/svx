@@ -1,6 +1,6 @@
-use crate::utils::util::Result;
-use anyhow::anyhow;
+use crate::{io::tpool::HtsThreadPool, utils::util::Result};
 use rust_htslib::bcf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum OutputType {
@@ -17,6 +17,7 @@ pub enum OutputType {
 pub struct VcfWriter {
     pub writer: bcf::Writer,
     pub dummy_record: bcf::Record,
+    _io_tpool: Option<Arc<HtsThreadPool>>,
 }
 
 impl VcfWriter {
@@ -24,6 +25,7 @@ impl VcfWriter {
         header: &bcf::Header,
         output_type: &Option<OutputType>,
         output: Option<&String>,
+        io_tpool: Option<Arc<HtsThreadPool>>,
     ) -> Result<Self> {
         let output_type = match (output_type, output) {
             (Some(output_type), _) => output_type.clone(),
@@ -35,7 +37,7 @@ impl VcfWriter {
         };
         log::trace!("{:?}", &output_type);
 
-        let writer = match output {
+        let mut writer = match output {
             Some(path) => {
                 let (is_uncompressed, format) = match output_type {
                     OutputType::Vcf {
@@ -59,11 +61,25 @@ impl VcfWriter {
                 bcf::Writer::from_stdout(header, is_uncompressed, format)
             }
         }
-        .map_err(|e| anyhow!("Failed to create writer: {}", e))?;
+        .map_err(|e| crate::svx_error!("Failed to create writer: {}", e))?;
+
+        if let Some(ref pool) = io_tpool {
+            unsafe {
+                pool.attach_to_writer(&mut writer).map_err(|e| {
+                    crate::svx_error!(
+                        "Failed to attach shared HTS thread pool to output writer: {}",
+                        e
+                    )
+                })?;
+                log::trace!("Attached shared HTS thread pool to output writer");
+            }
+        }
+
         let dummy_record = writer.empty_record();
         Ok(VcfWriter {
             writer,
             dummy_record,
+            _io_tpool: io_tpool,
         })
     }
 
@@ -91,5 +107,62 @@ impl VcfWriter {
                 level: None,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::tpool::HtsThreadPool;
+    use std::{
+        env::temp_dir,
+        fs,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn create_temp_path(ext: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut path = temp_dir();
+        path.push(format!("svx_test_vcf_writer_{nanos}.{ext}"));
+        path.to_string_lossy().into_owned()
+    }
+
+    fn make_header() -> bcf::Header {
+        let mut header = bcf::Header::new();
+        header.push_record(br#"##fileformat=VCFv4.3"#);
+        header.push_record(br#"##contig=<ID=chr1,length=1000>"#);
+        header.push_sample(b"S1");
+        header
+    }
+
+    #[test]
+    fn vcf_writer_keeps_shared_io_pool_when_provided() {
+        let header = make_header();
+        let out_path = create_temp_path("vcf.gz");
+        let io_tpool = Arc::new(HtsThreadPool::new(2).unwrap());
+
+        let writer =
+            VcfWriter::new(&header, &None, Some(&out_path), Some(io_tpool.clone())).unwrap();
+
+        let writer_pool = writer._io_tpool.as_ref().unwrap();
+        assert!(Arc::ptr_eq(writer_pool, &io_tpool));
+
+        fs::remove_file(out_path).unwrap();
+    }
+
+    #[test]
+    fn vcf_writer_has_no_io_pool_when_not_provided() {
+        let header = make_header();
+        let out_path = create_temp_path("vcf.gz");
+
+        let writer = VcfWriter::new(&header, &None, Some(&out_path), None).unwrap();
+
+        assert!(writer._io_tpool.is_none());
+
+        fs::remove_file(out_path).unwrap();
     }
 }

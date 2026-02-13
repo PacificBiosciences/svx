@@ -1,14 +1,12 @@
-use anyhow::anyhow;
+use crate::error::SvxResult;
 use log;
-use once_cell::sync::Lazy;
 use std::{
     fmt::{Binary, Display},
     path::Path,
     sync::Once,
 };
 
-/// Custom result type for error handling throughout the program.
-pub type Result<T> = anyhow::Result<T>;
+pub type Result<T> = SvxResult<T>;
 
 static INIT_LOG: Once = Once::new();
 
@@ -23,24 +21,48 @@ pub fn init_logger() {
 
 pub const MISSING_INTEGER: i32 = i32::MIN;
 pub const VECTOR_END_INTEGER: i32 = i32::MIN + 1;
-pub static _MISSING_FLOAT: Lazy<f32> = Lazy::new(|| f32::from_bits(0x7F80_0001));
-pub static _VECTOR_END_FLOAT: Lazy<f32> = Lazy::new(|| f32::from_bits(0x7F80_0002));
+pub const MISSING_FLOAT: f32 = f32::from_bits(0x7F80_0001);
+pub const VECTOR_END_FLOAT: f32 = f32::from_bits(0x7F80_0002);
 
-pub fn handle_error_and_exit(err: anyhow::Error) -> ! {
-    log::error!("{:#}", err);
+pub fn handle_error_and_exit(err: impl Display) -> ! {
+    log::error!("{err}");
     std::process::exit(1);
 }
 
 pub fn try_exists(path: &Path) -> Result<()> {
     if !path.exists() {
-        return Err(anyhow!("Path/File does not exist: {}", path.display()));
+        return Err(crate::svx_error!(
+            "Path/File does not exist: {}",
+            path.display()
+        ));
     }
     Ok(())
 }
 
-pub fn log_warning<T>(err: anyhow::Error, default: T) -> T {
-    log::warn!("{:#}", err);
+pub fn log_warning<T>(err: impl Display, default: T) -> T {
+    log::warn!("{err}");
     default
+}
+
+pub fn stable_hash64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+pub fn hash_bytes(bytes: &[u8]) -> i32 {
+    let mut res: i64 = 0;
+    const MOD: i64 = 1_000_000_007;
+    for &b in bytes {
+        res = (res * 17 + i64::from(b)) % MOD;
+    }
+    res as i32
 }
 
 pub fn format_number_with_commas<T>(n: T) -> String

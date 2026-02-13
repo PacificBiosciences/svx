@@ -1,26 +1,26 @@
-use clap::Parser;
+use anyhow::Result;
 use std::time;
 use svx::{
-    cli::{init_verbose, Cli, Command, FULL_VERSION},
+    cli::{Command, FULL_VERSION, init_verbose, parse_cli_with_config},
     commands::merge,
-    utils::util::{handle_error_and_exit, Result},
+    utils::util::handle_error_and_exit,
 };
 
 #[allow(unused_imports)]
 use svx::utils::util_intern::readable_size;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use svx::utils::util_intern::peak_memory_usage;
 
 fn runner() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli_with_config();
     init_verbose(&cli);
     log::trace!("CLI options set: {:?}", cli);
 
     log::info!(
         "Running {}-{} [{}]",
         env!("CARGO_PKG_NAME"),
-        &**FULL_VERSION,
+        FULL_VERSION,
         cli.command.name()
     );
 
@@ -33,7 +33,7 @@ fn runner() -> Result<()> {
     }
     log::info!("Total execution time: {:.2?}", start_timer.elapsed());
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let (size, unit) = readable_size(peak_memory_usage()?);
         log::info!("Peak memory use: {:.2} {}", size, unit);

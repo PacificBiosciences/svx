@@ -3,7 +3,6 @@ use crate::{
     core::containers::interval_tree::{Interval, IntervalTree},
     utils::util::Result,
 };
-use anyhow::anyhow;
 use std::{collections::HashMap, io::BufRead, path::Path};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -16,7 +15,7 @@ pub fn line_to_interval(line: &str) -> Result<(String, Interval<u32, TrId>)> {
     const EXPECTED_FIELD_COUNT: usize = 4;
     let split_line: Vec<&str> = line.split_whitespace().collect();
     if split_line.len() != EXPECTED_FIELD_COUNT {
-        return Err(anyhow!(
+        return Err(crate::svx_error!(
             "Expected {} fields in the format 'chrom start end info', found {}: {}",
             EXPECTED_FIELD_COUNT,
             split_line.len(),
@@ -31,10 +30,10 @@ pub fn line_to_interval(line: &str) -> Result<(String, Interval<u32, TrId>)> {
 
     let start: u32 = start
         .parse()
-        .map_err(|e| anyhow!("Invalid start position: {}", e))?;
+        .map_err(|e| crate::svx_error!("Invalid start position: {}", e))?;
     let end: u32 = end
         .parse()
-        .map_err(|e| anyhow!("Invalid end position: {}", e))?;
+        .map_err(|e| crate::svx_error!("Invalid end position: {}", e))?;
 
     let fields = decode_fields(info_fields)?;
     let id = get_field(&fields, "ID")?;
@@ -51,7 +50,7 @@ pub fn line_to_interval(line: &str) -> Result<(String, Interval<u32, TrId>)> {
 pub fn get_field(fields: &HashMap<&str, String>, key: &str) -> Result<String> {
     fields
         .get(key)
-        .ok_or_else(|| anyhow!("{} field missing", key))
+        .ok_or_else(|| crate::svx_error!("{} field missing", key))
         .map(|s| s.to_string())
 }
 
@@ -60,7 +59,7 @@ pub fn decode_fields(info_fields: &str) -> Result<HashMap<&str, String>> {
     for field_encoding in info_fields.split(';') {
         let (name, value) = decode_info_field(field_encoding)?;
         if fields.insert(name, value.to_string()).is_some() {
-            return Err(anyhow!("Duplicate field name: '{}'", name));
+            return Err(crate::svx_error!("Duplicate field name: '{}'", name));
         }
     }
     Ok(fields)
@@ -69,7 +68,7 @@ pub fn decode_fields(info_fields: &str) -> Result<HashMap<&str, String>> {
 fn decode_info_field(encoding: &str) -> Result<(&str, &str)> {
     let parts: Vec<&str> = encoding.splitn(2, '=').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        Err(anyhow!(
+        Err(crate::svx_error!(
             "Field must be in 'name=value' format: '{}'",
             encoding
         ))
@@ -90,10 +89,10 @@ impl BedMap {
         let mut interval_map: HashMap<String, Vec<Interval<u32, TrId>>> = HashMap::new();
 
         for (line_number, result_line) in reader.lines().enumerate() {
-            let line =
-                result_line.map_err(|e| anyhow!("Error at BED line {}: {}", line_number + 1, e))?;
+            let line = result_line
+                .map_err(|e| crate::svx_error!("Error at BED line {}: {}", line_number + 1, e))?;
             let (chrom, interval) = line_to_interval(&line)
-                .map_err(|e| anyhow!("Error at BED line {}: {}", line_number + 1, e))?;
+                .map_err(|e| crate::svx_error!("Error at BED line {}: {}", line_number + 1, e))?;
 
             interval_map.entry(chrom).or_default().push(interval);
         }
@@ -126,10 +125,8 @@ mod tests {
     fn test_line_to_interval_invalid() {
         let line_too_short = "chr1\t100";
         assert!(line_to_interval(line_too_short).is_err());
-
         let line_invalid_start = "chr1\tabc\t200";
         assert!(line_to_interval(line_invalid_start).is_err());
-
         let line_invalid_end = "chr1\t100\txyz";
         assert!(line_to_interval(line_invalid_end).is_err());
     }
@@ -147,12 +144,16 @@ mod tests {
         let chr1_tree = bed_map.interval_map.get("chr1").unwrap();
         let overlapping_chr1 = chr1_tree.find_overlapping(15, 55);
         assert_eq!(overlapping_chr1.len(), 2);
-        assert!(overlapping_chr1
-            .iter()
-            .any(|iv| iv.start == 10 && iv.stop == 20 && iv.value.id == "data1"));
-        assert!(overlapping_chr1
-            .iter()
-            .any(|iv| iv.start == 50 && iv.stop == 60 && iv.value.id == "data3"));
+        assert!(
+            overlapping_chr1
+                .iter()
+                .any(|iv| iv.start == 10 && iv.stop == 20 && iv.value.id == "data1")
+        );
+        assert!(
+            overlapping_chr1
+                .iter()
+                .any(|iv| iv.start == 50 && iv.stop == 60 && iv.value.id == "data3")
+        );
 
         let contained_chr1 = chr1_tree.find_contained(5, 65);
         assert_eq!(contained_chr1.len(), 2);

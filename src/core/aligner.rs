@@ -182,7 +182,7 @@ impl WFAttributes {
         self.inner.distance_metric = wfa2::distance_metric_t_gap_affine_2p;
         self.inner.affine2p_penalties.match_ = match_; // (Penalty representation usually M <= 0)
         self.inner.affine2p_penalties.mismatch = mismatch; // (Penalty representation usually X > 0)
-                                                           // Usually concave Q1 + E1 < Q2 + E2 and E1 > E2.
+        // Usually concave Q1 + E1 < Q2 + E2 and E1 > E2.
         self.inner.affine2p_penalties.gap_opening1 = gap_opening1; // (Penalty representation usually O1 > 0)
         self.inner.affine2p_penalties.gap_extension1 = gap_extension1; // (Penalty representation usually E1 > 0)
         self.inner.affine2p_penalties.gap_opening2 = gap_opening2; // (Penalty representation usually O2 > 0)

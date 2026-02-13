@@ -1,46 +1,54 @@
-<h1 align="center">SVX</h1>
+<h1 align="center"><img width="300px" src="docs/figures/logo_svx.svg" alt="svx"/></h1>
 
-<h3 align="center">Structural variation merging</h3>
+<h3 align="center">Structural variation aggregation</h3>
 
-SVX is a merging tool for structural variations called from PacBio HiFi sequencing data.
+Svx is a merging tool for structural variations (SVs) and copy number variations (CNVs) called by [sawfish](https://github.com/PacificBiosciences/sawfish) from PacBio HiFi sequencing data. Svx is largely inspired by [Jasmine](https://github.com/mkirsche/Jasmine), which frames multi-sample SV merging as a graph problem and uses a modified minimum-spanning-forest strategy to merge analogous variants across samples. Svx follows the same high-level philosophy while implementing its own Rust-native merge engine and constraints. Beyond the core merge algorithm, svx includes many ergonomic features, some examples: built-in parallelization across (and within) contigs, easy run scoping by contig and region, and selection of SV classes to include in the merge.
 
 ## Early version warning
 
-This is a **very early** pre-release of SVX and is under active development. Expect breaking changes at **all** levels, data formats, and system behavior.
+This is an **early** release of svx and is under development. Expect breaking changes at **all** levels, data formats, and system behavior.
 
 ### Limitations
 
-- **Only** the [sawfish](https://github.com/PacificBiosciences/sawfish) SV/CNV calling tool is currently supported
-- Support for BNDs is currently very limited
-- TR-specific logic is unstable
-- CNVs are not yet supported
-- Only single sample VCFs are supported
+- Currently **only** the [sawfish](https://github.com/PacificBiosciences/sawfish) SV/CNV calling tool is supported.
+- Currently **only** single sample VCFs are supported, as starting from single-sample VCFs preserves per-sample evidence and gives merging the most context.
+
+## Version information
+
+Current version: **0.5.0**.
+
+For a complete changelog, see the [changelog](CHANGELOG.md) or the git history.
 
 ## Availability
 
-- The latest SVX Linux binary is [available here](https://github.com/PacificBiosciences/svx/releases)
+- The latest svx Linux binary is [available here](https://github.com/PacificBiosciences/svx/releases)
 
 ## Documentation
 
-- [Basic use](docs/guide.md)
-- [Command line interface](docs/cli.md)
+- [Documentation index](docs/index.md)
+- [Usage guide](docs/guide.md)
+- [Tuning and defaults](docs/tuning.md)
+- [Output interpretation](docs/output.md)
+- [TR containment](docs/tr_containment.md)
+- [Merge constraints](docs/merge_constraints.md)
+- [Command line interface (generated reference)](docs/cli.md)
 
 ## Need help?
 
 If you notice any missing features, bugs, or need assistance with analyzing the
-output of SVX, please do not hesitate to [reach out by email](mailto:tmokveld@pacificbiosciences.com)
+output of svx, please do not hesitate to [reach out by email](mailto:tmokveld@pacificbiosciences.com)
 or open a GitHub issue.
 
 ## Support information
 
-SVX is currently in active development and is intended for research use only and not for use
-in diagnostic procedures. While efforts have been made to ensure that SVX
+Svx is currently in active development and is intended for research use only and not for use
+in diagnostic procedures. While efforts have been made to ensure that svx
 lives up to the quality that PacBio strives for, we make no warranty regarding
 this software.
 
-As SVX is not covered by any service level agreement or the like, please do
+As svx is not covered by any service level agreement or the like, please do
 not contact a PacBio Field Applications Scientists or PacBio Customer Service
-for assistance with any SVX release. Please report all issues through GitHub
+for assistance with any svx release. Please report all issues through GitHub
 instead. We make no warranty that any such issue will be addressed, to any
 extent or within any time frame.
 

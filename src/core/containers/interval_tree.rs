@@ -42,6 +42,11 @@ pub struct IntervalTree<Scalar, Value> {
     left: Option<Box<IntervalTree<Scalar, Value>>>,
     right: Option<Box<IntervalTree<Scalar, Value>>>,
     center: Scalar,
+    // Cached bounds of `self.intervals` (the "center" bucket) for fast pruning in queries.
+    // IMPORTANT: `self.intervals` are sorted by `start`, so `intervals.last().stop` is NOT
+    // necessarily the maximum stop; we must track it explicitly.
+    min_start: Scalar,
+    max_stop: Scalar,
 }
 
 impl<Scalar, Value> IntervalTree<Scalar, Value>
@@ -56,6 +61,8 @@ where
             left: None,
             right: None,
             center: Scalar::zero(),
+            min_start: Scalar::zero(),
+            max_stop: Scalar::zero(),
         }
     }
 
@@ -88,11 +95,24 @@ where
         let center = (left_extent + right_extent) / (Scalar::one() + Scalar::one());
 
         if depth == 0 || (intervals.len() < minbucket && intervals.len() < maxbucket) {
+            let (min_start, max_stop) = if intervals.is_empty() {
+                (center, center)
+            } else {
+                let min_start = intervals.first().unwrap().start;
+                let max_stop = intervals
+                    .iter()
+                    .map(|i| i.stop)
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                    .unwrap();
+                (min_start, max_stop)
+            };
             return Self {
                 intervals,
                 left: None,
                 right: None,
                 center,
+                min_start,
+                max_stop,
             };
         }
 
@@ -100,6 +120,18 @@ where
             intervals.into_iter().partition(|i| i.stop < center);
         let (centers, rights): (Vec<_>, Vec<_>) =
             centers.into_iter().partition(|i| i.start <= center);
+
+        let (min_start, max_stop) = if centers.is_empty() {
+            (center, center)
+        } else {
+            let min_start = centers.first().unwrap().start;
+            let max_stop = centers
+                .iter()
+                .map(|i| i.stop)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                .unwrap();
+            (min_start, max_stop)
+        };
 
         let left = (!lefts.is_empty()).then(|| {
             Box::new(Self::build_tree(
@@ -127,6 +159,8 @@ where
             left,
             right,
             center,
+            min_start,
+            max_stop,
         }
     }
 
@@ -137,32 +171,47 @@ where
             && self.right.as_ref().is_none_or(|r| r.is_empty())
     }
 
-    pub fn visit_near<F>(&self, start: Scalar, stop: Scalar, f: &mut F)
+    fn visit_near_while<F>(&self, start: Scalar, stop: Scalar, f: &mut F) -> bool
     where
-        F: FnMut(&Interval<Scalar, Value>),
+        F: FnMut(&Interval<Scalar, Value>) -> bool,
     {
-        if !(self.intervals.is_empty()
-            || stop < self.intervals[0].start
-            || start > self.intervals.last().unwrap().stop)
-        {
+        if !(self.intervals.is_empty() || stop < self.min_start || start > self.max_stop) {
             for interval in &self.intervals {
-                if interval.stop >= start && interval.start <= stop {
-                    f(interval);
+                if interval.stop >= start && interval.start <= stop && !f(interval) {
+                    return false;
                 }
             }
         }
 
-        if start <= self.center {
-            if let Some(ref left) = self.left {
-                left.visit_near(start, stop, f);
-            }
+        if start <= self.center
+            && self
+                .left
+                .as_ref()
+                .is_some_and(|left| !left.visit_near_while(start, stop, f))
+        {
+            return false;
         }
 
-        if stop >= self.center {
-            if let Some(ref right) = self.right {
-                right.visit_near(start, stop, f);
-            }
+        if stop >= self.center
+            && self
+                .right
+                .as_ref()
+                .is_some_and(|right| !right.visit_near_while(start, stop, f))
+        {
+            return false;
         }
+
+        true
+    }
+
+    pub fn visit_near<F>(&self, start: Scalar, stop: Scalar, f: &mut F)
+    where
+        F: FnMut(&Interval<Scalar, Value>),
+    {
+        self.visit_near_while(start, stop, &mut |i| {
+            f(i);
+            true
+        });
     }
 
     #[inline]
@@ -189,6 +238,29 @@ where
         });
     }
 
+    #[inline]
+    pub fn visit_containing_while<F>(&self, start: Scalar, stop: Scalar, f: &mut F) -> bool
+    where
+        F: FnMut(&Interval<Scalar, Value>) -> bool,
+    {
+        self.visit_near_while(start, stop, &mut |i| {
+            if i.start <= start && i.stop >= stop {
+                return f(i);
+            }
+            true
+        })
+    }
+
+    #[inline]
+    pub fn any_containing(&self, start: Scalar, stop: Scalar) -> bool {
+        let mut found = false;
+        self.visit_containing_while(start, stop, &mut |_| {
+            found = true;
+            false
+        });
+        found
+    }
+
     pub fn find_overlapping(&self, start: Scalar, stop: Scalar) -> Vec<Interval<Scalar, Value>>
     where
         Value: Clone,
@@ -212,10 +284,9 @@ where
         Value: Clone,
     {
         let mut result = Vec::new();
-        self.visit_overlapping(start, stop, &mut |i| {
-            if i.start <= start && i.stop >= stop {
-                result.push(i.clone());
-            }
+        self.visit_containing_while(start, stop, &mut |i| {
+            result.push(i.clone());
+            true
         });
         result
     }
@@ -285,28 +356,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
-    use std::cmp::min;
-    use std::collections::HashSet;
-    use std::f64;
-    use std::time::Instant;
+    use proptest::prelude::*;
 
-    fn random_interval<Value>(
-        min_start: i32,
-        max_stop: i32,
-        min_len: i32,
-        max_len: i32,
-        value: Value,
-    ) -> Interval<i32, Value>
-    where
-        Value: Clone,
-    {
-        let mut rng = rand::rng();
-        let len = rng.random_range(min_len..=max_len);
-        let start = rng.random_range(min_start..=max_stop - len);
-        let stop = min(start + len - 1, max_stop);
-        Interval::new(start, stop, value)
-    }
+    const MIN: i64 = -1_000_000;
+    const MAX: i64 = 1_000_000;
 
     #[test]
     fn test_interval_display() {
@@ -316,57 +369,74 @@ mod tests {
     }
 
     #[test]
-    fn test_interval_new_ordering() {
+    fn overlap_not_pruned_by_last_stop() {
+        let tree = IntervalTree::new(vec![
+            Interval::new(0i32, 100i32, 1usize),
+            Interval::new(40i32, 60i32, 2usize),
+        ]);
+
+        let hits = tree.find_overlapping(90, 95);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0], Interval::new(0, 100, 1));
+    }
+
+    #[test]
+    fn interval_new_normalizes_endpoints() {
         let interval = Interval::new(5, 2, 42);
         assert_eq!(interval.start, 2);
         assert_eq!(interval.stop, 5);
         assert_eq!(interval.value, 42);
+
+        let interval = Interval::new(3, 3, 42);
+        assert_eq!(interval.start, 3);
+        assert_eq!(interval.stop, 3);
+
+        let interval = Interval::new(-5, -2, 42);
+        assert_eq!(interval.start, -5);
+        assert_eq!(interval.stop, -2);
     }
 
     #[test]
-    fn test_empty_tree_default_center() {
+    fn empty_tree_is_empty() {
         let t: IntervalTree<i32, i32> = IntervalTree::new(Vec::new());
         assert!(t.is_empty());
-        assert_eq!(t.center, 0);
+
+        assert!(t.find_overlapping(0, 0).is_empty());
+        assert!(t.find_contained(0, 0).is_empty());
+        assert!(t.find_containing(0, 0).is_empty());
     }
 
     #[test]
-    fn test_default_impl() {
-        let t: IntervalTree<i32, i32> = IntervalTree::default();
-        assert!(t.is_empty());
-        assert_eq!(t.center, 0);
-        assert!(t.left.is_none());
-        assert!(t.right.is_none());
-        assert!(t.intervals.is_empty());
+    fn any_containing_matches_find_containing_non_empty() {
+        let t = IntervalTree::new(vec![
+            Interval::new(0, 10, 1usize),
+            Interval::new(20, 30, 2usize),
+            Interval::new(25, 40, 3usize),
+        ]);
+
+        let queries = vec![(0, 1), (5, 6), (10, 11), (20, 21), (31, 32), (24, 29)];
+        for (qs, qe) in queries {
+            let expected = !t.find_containing(qs, qe).is_empty();
+            assert_eq!(t.any_containing(qs, qe), expected);
+        }
     }
 
     #[test]
-    fn test_build_tree_with_empty_intervals() {
-        let intervals: Vec<Interval<i32, i32>> = Vec::new();
-        let t = IntervalTree::new(intervals);
-        assert!(t.is_empty());
-        assert_eq!(t.center, 0);
-    }
+    fn visit_containing_while_stops_after_first_match() {
+        let t = IntervalTree::new(vec![
+            Interval::new(0, 100, 1usize),
+            Interval::new(10, 90, 2usize),
+            Interval::new(20, 80, 3usize),
+        ]);
 
-    #[test]
-    fn test_center_initialization_with_non_zero_scalar() {
-        let t: IntervalTree<f64, i32> = IntervalTree::default();
-        assert!(t.is_empty());
-        assert_eq!(t.center, 0.0);
-    }
+        let mut visited = 0usize;
+        let completed = t.visit_containing_while(50, 51, &mut |_| {
+            visited += 1;
+            false
+        });
 
-    #[test]
-    fn test_zero_length_intervals_in_search() {
-        let intervals = vec![Interval::new(5, 5, "zero")];
-        let t = IntervalTree::new(intervals);
-
-        let result_overlapping = t.find_overlapping(5, 5);
-        assert_eq!(result_overlapping.len(), 1);
-        assert_eq!(result_overlapping[0].value, "zero");
-
-        let result_contained = t.find_contained(5, 5);
-        assert_eq!(result_contained.len(), 1);
-        assert_eq!(result_contained[0].value, "zero");
+        assert!(!completed);
+        assert_eq!(visited, 1);
     }
 
     #[test]
@@ -430,124 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn test_interval_new_zero_length() {
-        let interval = Interval::new(3, 3, 42);
-        assert_eq!(interval.start, 3);
-        assert_eq!(interval.stop, 3);
-        assert_eq!(interval.value, 42);
-    }
-
-    #[test]
-    fn test_interval_new_negative_scalars() {
-        let interval = Interval::new(-5, -2, 42);
-        assert_eq!(interval.start, -5);
-        assert_eq!(interval.stop, -2);
-        assert_eq!(interval.value, 42);
-    }
-
-    #[test]
-    fn test_is_empty_tree() {
-        let t: IntervalTree<isize, i32> = IntervalTree::new(Vec::new());
-        assert!(t.is_empty());
-
-        let intervals = vec![Interval::new(1, 5, 42)];
-        let t = IntervalTree::new(intervals);
-        assert!(!t.is_empty());
-    }
-
-    #[test]
-    fn test_zero_length_intervals() {
-        let intervals = vec![Interval::new(5, 5, 42)];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(5, 5);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].start, 5);
-        assert_eq!(result[0].stop, 5);
-        assert_eq!(result[0].value, 42);
-    }
-
-    #[test]
-    fn test_zero_length_interval_no_overlap() {
-        let intervals = vec![Interval::new(5, 5, 42)];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(4, 4);
-        assert_eq!(result.len(), 0);
-        let result = t.find_overlapping(6, 6);
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_negative_intervals() {
-        let intervals = vec![Interval::new(-10, -5, 42)];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(-7, -6);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].start, -10);
-        assert_eq!(result[0].stop, -5);
-        assert_eq!(result[0].value, 42);
-    }
-
-    #[test]
-    fn test_overlapping_intervals() {
-        let intervals = vec![
-            Interval::new(1, 5, "a"),
-            Interval::new(3, 7, "b"),
-            Interval::new(4, 6, "c"),
-        ];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(4, 4);
-        assert_eq!(result.len(), 3);
-        let values: Vec<_> = result.iter().map(|i| i.value).collect();
-        assert!(values.contains(&"a"));
-        assert!(values.contains(&"b"));
-        assert!(values.contains(&"c"));
-    }
-
-    #[test]
-    fn test_nested_intervals() {
-        let intervals = vec![
-            Interval::new(1, 10, "outer"),
-            Interval::new(3, 7, "middle"),
-            Interval::new(4, 5, "inner"),
-        ];
-        let t = IntervalTree::new(intervals);
-        let result = t.find_contained(2, 8);
-        assert_eq!(result.len(), 2);
-        let values: Vec<_> = result.iter().map(|i| i.value).collect();
-        assert!(values.contains(&"middle"));
-        assert!(values.contains(&"inner"));
-    }
-
-    #[test]
-    fn test_boundary_overlap() {
-        let intervals = vec![Interval::new(1, 5, "a"), Interval::new(5, 10, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(5, 5);
-        assert_eq!(result.len(), 2);
-        let values: Vec<_> = result.iter().map(|i| i.value).collect();
-        assert!(values.contains(&"a"));
-        assert!(values.contains(&"b"));
-    }
-
-    #[test]
-    fn test_adjacent_intervals_no_overlap() {
-        let intervals = vec![Interval::new(1, 5, "a"), Interval::new(5, 10, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(0, 1);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, "a");
-
-        let result = t.find_overlapping(11, 15);
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
     fn test_display_interval_tree() {
         let intervals = vec![Interval::new(1, 5, "a"), Interval::new(3, 7, "b")];
         let t = IntervalTree::new(intervals);
@@ -555,57 +507,6 @@ mod tests {
         assert!(output.contains(
             "center: 4\nInterval(1, 5): a\nInterval(3, 7): b\nleft: None\nright: None\n"
         ));
-    }
-
-    #[test]
-    fn test_center_computation() {
-        let intervals = vec![Interval::new(1, 7, "a"), Interval::new(3, 5, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let expected_center = 1 + (7 - 1) / 2;
-        assert_eq!(t.center, expected_center);
-    }
-
-    #[test]
-    fn test_center_computation_f64() {
-        let intervals = vec![Interval::new(1.0, 7.0, "a"), Interval::new(3.0, 5.0, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let expected_center = 1.0 + (7.0 - 1.0) / 2.0;
-        assert_eq!(t.center, expected_center);
-    }
-
-    #[test]
-    fn test_center_computation_multiple() {
-        let intervals = vec![
-            Interval::new(4, 7, "a"),
-            Interval::new(90, 130, "b"),
-            Interval::new(3, 5, "c"),
-            Interval::new(12, 15, "d"),
-        ];
-        let t = IntervalTree::new(intervals);
-        let expected_center = 3 + (130 - 3) / 2;
-        assert_eq!(t.center, expected_center);
-    }
-
-    #[test]
-    fn test_visit_all() {
-        let intervals = vec![
-            Interval::new(1, 5, "a"),
-            Interval::new(3, 7, "b"),
-            Interval::new(6, 10, "c"),
-        ];
-        let t = IntervalTree::new(intervals.clone());
-
-        let mut visited_intervals = Vec::new();
-        t.visit_all(&mut |interval| {
-            visited_intervals.push(interval.clone());
-        });
-
-        assert_eq!(visited_intervals.len(), intervals.len());
-        for interval in intervals {
-            assert!(visited_intervals.contains(&interval));
-        }
     }
 
     #[test]
@@ -628,44 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_overlapping_no_overlap() {
-        let intervals = vec![Interval::new(1, 5, "a"), Interval::new(6, 10, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(11, 15);
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_find_contained_no_containment() {
-        let intervals = vec![Interval::new(1, 5, "a"), Interval::new(6, 10, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_contained(0, 7);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, "a");
-
-        let result = t.find_contained(2, 12);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, "b");
-
-        let result = t.find_contained(0, 15);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn test_duplicate_intervals() {
-        let intervals = vec![Interval::new(1, 5, "a"), Interval::new(1, 5, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let result = t.find_overlapping(3, 3);
-        assert_eq!(result.len(), 2);
-        let values: Vec<_> = result.iter().map(|i| i.value).collect();
-        assert!(values.contains(&"a"));
-        assert!(values.contains(&"b"));
-    }
-
-    #[test]
     fn test_large_number_of_intervals() {
         let mut intervals = Vec::new();
         for i in 0..1000 {
@@ -678,97 +541,6 @@ mod tests {
         for interval in result {
             assert!(interval.start <= 505 && interval.stop >= 500);
         }
-    }
-
-    #[test]
-    fn test_visit_near() {
-        let intervals = vec![
-            Interval::new(1, 5, "a"),
-            Interval::new(6, 10, "b"),
-            Interval::new(11, 15, "c"),
-        ];
-        let t = IntervalTree::new(intervals);
-
-        let mut visited_values = Vec::new();
-        t.visit_near(4, 12, &mut |interval| {
-            visited_values.push(interval.value);
-        });
-
-        assert_eq!(visited_values.len(), 3);
-        assert!(visited_values.contains(&"a"));
-        assert!(visited_values.contains(&"b"));
-        assert!(visited_values.contains(&"c"));
-    }
-
-    #[test]
-    fn test_visit_overlapping_edge_cases() {
-        let intervals = vec![
-            Interval::new(1, 5, "a"),
-            Interval::new(5, 10, "b"),
-            Interval::new(10, 15, "c"),
-        ];
-        let t = IntervalTree::new(intervals);
-
-        let mut collected = Vec::new();
-        t.visit_overlapping(5, 10, &mut |interval| {
-            collected.push(interval.value);
-        });
-        assert_eq!(collected.len(), 3);
-        assert!(collected.contains(&"a"));
-        assert!(collected.contains(&"b"));
-        assert!(collected.contains(&"c"));
-    }
-
-    #[test]
-    fn test_visit_near_outside_range() {
-        let intervals = vec![Interval::new(1, 3, "a"), Interval::new(7, 9, "b")];
-        let t = IntervalTree::new(intervals);
-
-        let mut visited = Vec::new();
-        t.visit_near(4, 6, &mut |interval| {
-            visited.push(interval.value);
-        });
-        assert!(visited.is_empty());
-    }
-
-    #[test]
-    fn test_singleton_tree() {
-        let intervals = vec![Interval::new(1usize, 3usize, 5.5)];
-        let t = IntervalTree::new(intervals);
-
-        // Point query on left
-        {
-            let v = t.find_overlapping(1, 1);
-            assert_eq!(v.len(), 1);
-            assert_eq!(v[0].start, 1);
-            assert_eq!(v[0].stop, 3);
-            assert_eq!(v[0].value, 5.5);
-        }
-
-        // Point query in middle
-        {
-            let v = t.find_overlapping(2, 2);
-            assert_eq!(v.len(), 1);
-            assert_eq!(v[0].start, 1);
-            assert_eq!(v[0].stop, 3);
-            assert_eq!(v[0].value, 5.5);
-        }
-
-        // Point query on right
-        {
-            let v = t.find_overlapping(3, 3);
-            assert_eq!(v.len(), 1);
-            assert_eq!(v[0].start, 1);
-            assert_eq!(v[0].stop, 3);
-            assert_eq!(v[0].value, 5.5);
-        }
-
-        // Non-overlapping queries
-        let v = t.find_overlapping(4, 4);
-        assert_eq!(v.len(), 0);
-
-        let v = t.find_overlapping(0, 0);
-        assert_eq!(v.len(), 0);
     }
 
     #[test]
@@ -818,120 +590,151 @@ mod tests {
         assert_eq!(sanity_results.len(), 0);
     }
 
-    #[test]
-    fn test_two_identical_intervals_with_different_contents() {
-        let intervals = vec![
-            Interval::new(5usize, 10usize, 10.5),
-            Interval::new(5usize, 10usize, 5.5),
-        ];
-        let t = IntervalTree::new(intervals);
-
-        let v = t.find_overlapping(6, 6);
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0].start, 5);
-        assert_eq!(v[0].stop, 10);
-        assert_eq!(v[1].start, 5);
-        assert_eq!(v[1].stop, 10);
-
-        let expected = vec![5.5, 10.5];
-        let mut actual: Vec<_> = v.iter().map(|i| i.value).collect();
-        actual.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mut expected_sorted = expected.clone();
-        expected_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert_eq!(actual, expected_sorted);
+    #[inline]
+    fn norm(a: i64, b: i64) -> (i64, i64) {
+        if a <= b { (a, b) } else { (b, a) }
     }
 
-    #[test]
-    fn test_find_containing() {
-        let intervals = vec![
-            Interval::new(0, 10, "A"),
-            Interval::new(5, 15, "B"),
-            Interval::new(10, 20, "C"),
-            Interval::new(15, 25, "D"),
-            Interval::new(20, 30, "E"),
-            Interval::new(0, 30, "F"),
-        ];
-
-        let tree = IntervalTree::new(intervals);
-
-        let result = tree.find_containing(10, 10);
-        assert_eq!(result.len(), 4);
-        let expected: HashSet<_> = ["A", "B", "C", "F"].into();
-        assert!(result.iter().all(|i| expected.contains(&i.value)));
-
-        let result = tree.find_containing(12, 18);
-        assert_eq!(result.len(), 2);
-        let expected: HashSet<_> = ["C", "F"].into();
-        assert!(result.iter().all(|i| expected.contains(&i.value)));
-
-        let result = tree.find_containing(5, 25);
-        assert_eq!(result.len(), 1);
-        let expected: HashSet<_> = ["F"].into();
-        assert!(result.iter().all(|i| expected.contains(&i.value)));
-
-        let result = tree.find_containing(15, 25);
-        assert_eq!(result.len(), 2);
-        let expected: HashSet<_> = ["D", "F"].into();
-        assert!(result.iter().all(|i| expected.contains(&i.value)));
-
-        let result = tree.find_containing(12, 31);
-        assert_eq!(result.len(), 0);
-
-        let result = tree.find_containing(-1, 28);
-        assert_eq!(result.len(), 0);
-
-        let result = tree.find_containing(0, 30);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, "F");
-
-        let result = tree.find_containing(40, 50);
-        assert_eq!(result.len(), 0);
+    #[inline]
+    fn intervals_from_raw(raw: Vec<(i64, i64)>) -> Vec<Interval<i64, usize>> {
+        raw.into_iter()
+            .enumerate()
+            .map(|(id, (s, e))| Interval::new(s, e, id))
+            .collect()
     }
 
-    #[test]
-    #[ignore]
-    fn brute_force() {
-        const N_INTERVALS: usize = 10_000;
-        const N_QUERIES: usize = 5000;
+    #[inline]
+    fn sorted(mut ids: Vec<usize>) -> Vec<usize> {
+        ids.sort_unstable();
+        ids
+    }
 
-        let mut intervals = Vec::new();
-        for _ in 0..N_INTERVALS {
-            intervals.push(random_interval(0, 1_000_000, 20, 2000, 1));
+    #[inline]
+    fn naive_overlapping(intervals: &[Interval<i64, usize>], qs: i64, qe: i64) -> Vec<usize> {
+        sorted(
+            intervals
+                .iter()
+                .filter(|i| i.stop >= qs && i.start <= qe)
+                .map(|i| i.value)
+                .collect(),
+        )
+    }
+
+    #[inline]
+    fn naive_contained(intervals: &[Interval<i64, usize>], qs: i64, qe: i64) -> Vec<usize> {
+        sorted(
+            intervals
+                .iter()
+                .filter(|i| i.start >= qs && i.stop <= qe)
+                .map(|i| i.value)
+                .collect(),
+        )
+    }
+
+    #[inline]
+    fn naive_containing(intervals: &[Interval<i64, usize>], qs: i64, qe: i64) -> Vec<usize> {
+        sorted(
+            intervals
+                .iter()
+                .filter(|i| i.start <= qs && i.stop >= qe)
+                .map(|i| i.value)
+                .collect(),
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn prop_overlapping_matches_naive(
+            raw in proptest::collection::vec((MIN..=MAX, MIN..=MAX), 0..200),
+            q in (MIN..=MAX, MIN..=MAX),
+        ) {
+            let intervals = intervals_from_raw(raw);
+            let tree = IntervalTree::new(intervals.clone());
+            let (qs, qe) = norm(q.0, q.1);
+
+            let naive = naive_overlapping(&intervals, qs, qe);
+            let got = sorted(
+                tree.find_overlapping(qs, qe)
+                    .into_iter()
+                    .map(|i| i.value)
+                    .collect(),
+            );
+            prop_assert_eq!(got, naive);
         }
 
-        let mut queries = Vec::new();
-        for _ in 0..N_QUERIES {
-            queries.push(random_interval(0, 1_000_000, 20, 2000, 1));
+        #[test]
+        fn prop_contained_matches_naive(
+            raw in proptest::collection::vec((MIN..=MAX, MIN..=MAX), 0..200),
+            q in (MIN..=MAX, MIN..=MAX),
+        ) {
+            let intervals = intervals_from_raw(raw);
+            let tree = IntervalTree::new(intervals.clone());
+            let (qs, qe) = norm(q.0, q.1);
+
+            let naive = naive_contained(&intervals, qs, qe);
+            let got = sorted(
+                tree.find_contained(qs, qe)
+                    .into_iter()
+                    .map(|i| i.value)
+                    .collect(),
+            );
+            prop_assert_eq!(got, naive);
         }
 
-        let mut bruteforcecounts = Vec::new();
-        let t0 = Instant::now();
-        for q in &queries {
-            let mut results = Vec::new();
-            for i in &intervals {
-                if i.start >= q.start && i.stop <= q.stop {
-                    results.push(i.clone());
-                }
-            }
-            bruteforcecounts.push(results.len());
-        }
-        let t1 = Instant::now();
-        let duration = t1 - t0;
-        println!("Brute force:\t{:?}", duration);
+        #[test]
+        fn prop_containing_matches_naive(
+            raw in proptest::collection::vec((MIN..=MAX, MIN..=MAX), 0..200),
+            q in (MIN..=MAX, MIN..=MAX),
+        ) {
+            let intervals = intervals_from_raw(raw);
+            let tree = IntervalTree::new(intervals.clone());
+            let (qs, qe) = norm(q.0, q.1);
 
-        let tree = IntervalTree::new(intervals.clone());
-        let mut treecounts = Vec::new();
-        let t0 = Instant::now();
-        for q in &queries {
-            let results = tree.find_contained(q.start, q.stop);
-            treecounts.push(results.len());
+            let naive = naive_containing(&intervals, qs, qe);
+            let got = sorted(
+                tree.find_containing(qs, qe)
+                    .into_iter()
+                    .map(|i| i.value)
+                    .collect(),
+            );
+            prop_assert_eq!(got, naive);
         }
-        let t1 = Instant::now();
-        let duration = t1 - t0;
-        println!("Interval tree:\t{:?}", duration);
-        for (b, t) in bruteforcecounts.iter().zip(treecounts.iter()) {
-            assert_eq!(b, t);
+
+        #[test]
+        fn prop_visit_near_matches_naive_overlap(
+            raw in proptest::collection::vec((MIN..=MAX, MIN..=MAX), 0..200),
+            q in (MIN..=MAX, MIN..=MAX),
+        ) {
+            let intervals = intervals_from_raw(raw);
+            let tree = IntervalTree::new(intervals.clone());
+            let (qs, qe) = norm(q.0, q.1);
+
+            let naive = naive_overlapping(&intervals, qs, qe);
+            let mut got = Vec::new();
+            tree.visit_near(qs, qe, &mut |i| got.push(i.value));
+            prop_assert_eq!(sorted(got), naive);
         }
-        println!("All counts match!");
+
+        #[test]
+        fn prop_visit_all_returns_every_interval_exactly_once(
+            raw in proptest::collection::vec((MIN..=MAX, MIN..=MAX), 0..200),
+        ) {
+            let intervals = intervals_from_raw(raw);
+            let n = intervals.len();
+            let tree = IntervalTree::new(intervals);
+
+            let mut got = Vec::with_capacity(n);
+            tree.visit_all(&mut |i| got.push(i.value));
+            prop_assert_eq!(sorted(got), (0..n).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn prop_is_empty_matches_input_len(
+            raw in proptest::collection::vec((MIN..=MAX, MIN..=MAX), 0..200),
+        ) {
+            let intervals = intervals_from_raw(raw);
+            let tree = IntervalTree::new(intervals.clone());
+            prop_assert_eq!(tree.is_empty(), intervals.is_empty());
+        }
     }
 }
