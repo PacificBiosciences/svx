@@ -18,6 +18,7 @@ pub mod io {
     pub mod bed_reader;
     pub mod merge_reader;
     pub mod merge_writer;
+    pub mod output_sort;
     pub mod positions_reader;
     pub mod readers;
     pub mod tpool;

@@ -9,40 +9,43 @@ use std::{
     time::Duration,
 };
 
-pub(crate) enum ProgressEvent {
+pub enum ProgressEvent {
     ContigCompleted { contig: String },
+    ContigScanDone,
     VariantsQueued { variants: u64 },
     ReaderDone,
     VariantsMerged { variants: u64 },
     WriterAdvanced { variants: u64, records: u64 },
+    WriterSortFinalizeStart,
+    WriterSortFinalizeDone,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct QueueDepthSnapshot {
-    pub(crate) current: usize,
-    pub(crate) peak: usize,
+pub struct QueueDepthSnapshot {
+    pub current: usize,
+    pub peak: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PipelineQueueSnapshot {
-    pub(crate) blob: QueueDepthSnapshot,
-    pub(crate) result: QueueDepthSnapshot,
+pub struct PipelineQueueSnapshot {
+    pub blob: QueueDepthSnapshot,
+    pub result: QueueDepthSnapshot,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct QueueDepthTracker {
+pub struct QueueDepthTracker {
     current: AtomicUsize,
     peak: AtomicUsize,
 }
 
 impl QueueDepthTracker {
-    pub(crate) fn increment(&self) -> usize {
+    pub fn increment(&self) -> usize {
         let current = self.current.fetch_add(1, Ordering::Relaxed) + 1;
         self.update_peak(current);
         current
     }
 
-    pub(crate) fn decrement(&self) -> usize {
+    pub fn decrement(&self) -> usize {
         let mut observed = self.current.load(Ordering::Relaxed);
         loop {
             if observed == 0 {
@@ -60,7 +63,7 @@ impl QueueDepthTracker {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> QueueDepthSnapshot {
+    pub fn snapshot(&self) -> QueueDepthSnapshot {
         QueueDepthSnapshot {
             current: self.current.load(Ordering::Relaxed),
             peak: self.peak.load(Ordering::Relaxed),
@@ -84,13 +87,13 @@ impl QueueDepthTracker {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct PipelineQueueMetrics {
-    pub(crate) blob: QueueDepthTracker,
-    pub(crate) result: QueueDepthTracker,
+pub struct PipelineQueueMetrics {
+    pub blob: QueueDepthTracker,
+    pub result: QueueDepthTracker,
 }
 
 impl PipelineQueueMetrics {
-    pub(crate) fn snapshot(&self) -> PipelineQueueSnapshot {
+    pub fn snapshot(&self) -> PipelineQueueSnapshot {
         PipelineQueueSnapshot {
             blob: self.blob.snapshot(),
             result: self.result.snapshot(),
@@ -98,7 +101,7 @@ impl PipelineQueueMetrics {
     }
 }
 
-pub(crate) fn compute_progress_enabled(
+pub fn compute_progress_enabled(
     force_progress: bool,
     disable_progress: bool,
     is_stderr_tty: bool,
@@ -119,13 +122,13 @@ pub(crate) fn compute_progress_enabled(
     )
 }
 
-pub(crate) fn compute_pipeline_queue_capacities(num_threads: usize) -> (usize, usize) {
+pub fn compute_pipeline_queue_capacities(num_threads: usize) -> (usize, usize) {
     let blob_queue_capacity = num_threads.saturating_mul(2).clamp(4, 64);
     let result_queue_capacity = num_threads.saturating_mul(4).clamp(8, 128);
     (blob_queue_capacity, result_queue_capacity)
 }
 
-pub(crate) fn resolve_pipeline_queue_capacities(
+pub fn resolve_pipeline_queue_capacities(
     num_threads: usize,
     blob_override: Option<usize>,
     result_override: Option<usize>,
@@ -137,10 +140,7 @@ pub(crate) fn resolve_pipeline_queue_capacities(
     )
 }
 
-pub(crate) fn send_progress_event(
-    progress_sender: Option<&Sender<ProgressEvent>>,
-    event: ProgressEvent,
-) {
+pub fn send_progress_event(progress_sender: Option<&Sender<ProgressEvent>>, event: ProgressEvent) {
     if let Some(sender) = progress_sender {
         if sender.send(event).is_err() {
             log::debug!("Progress channel receiver closed unexpectedly.");
@@ -165,7 +165,8 @@ fn merge_progress_style() -> ProgressStyle {
         .progress_chars("=> ")
 }
 
-pub(crate) fn build_merge_progress_message(
+pub fn build_merge_progress_message(
+    stage: &str,
     queued_variants: u64,
     merged_variants: u64,
     written_variants: u64,
@@ -173,7 +174,7 @@ pub(crate) fn build_merge_progress_message(
     queue_snapshot: Option<PipelineQueueSnapshot>,
 ) -> String {
     let base = format!(
-        "read={queued_variants} merged={merged_variants} written={written_variants} records={written_records}"
+        "stage={stage} read={queued_variants} merged={merged_variants} written={written_variants} records={written_records}"
     );
     if let Some(snapshot) = queue_snapshot {
         format!(
@@ -190,6 +191,7 @@ pub(crate) fn build_merge_progress_message(
 
 fn update_merge_progress_message(
     merge_bar: &ProgressBar,
+    stage: &str,
     queued_variants: u64,
     merged_variants: u64,
     written_variants: u64,
@@ -197,6 +199,7 @@ fn update_merge_progress_message(
     queue_snapshot: Option<PipelineQueueSnapshot>,
 ) {
     merge_bar.set_message(build_merge_progress_message(
+        stage,
         queued_variants,
         merged_variants,
         written_variants,
@@ -205,7 +208,33 @@ fn update_merge_progress_message(
     ));
 }
 
-pub(crate) fn run_progress_ui(
+fn merge_stage_label(
+    contig_scan_done: bool,
+    reader_done: bool,
+    sort_finalize_active: bool,
+    queued_variants: u64,
+    merged_variants: u64,
+    written_variants: u64,
+) -> &'static str {
+    if sort_finalize_active {
+        return "final_sort_flush";
+    }
+    if !contig_scan_done {
+        return "processing";
+    }
+    if !reader_done {
+        return "finalizing_bnd_workload";
+    }
+    if merged_variants < queued_variants {
+        return "processing_backlog";
+    }
+    if written_variants < queued_variants {
+        return "flushing_output";
+    }
+    "final_drain"
+}
+
+pub fn run_progress_ui(
     progress_receiver: Receiver<ProgressEvent>,
     total_contigs: u64,
     queue_metrics: Option<Arc<PipelineQueueMetrics>>,
@@ -226,11 +255,30 @@ pub(crate) fn run_progress_ui(
     let mut merged_variants = 0u64;
     let mut written_variants = 0u64;
     let mut written_records = 0u64;
+    let mut contig_scan_done = total_contigs == 0;
     let mut reader_done = false;
+    let mut sort_finalize_active = false;
+    let mut merge_bar_in_progress_mode = false;
+
+    if contig_scan_done {
+        merge_bar.set_style(merge_progress_style());
+        merge_bar.set_length(queued_variants);
+        merge_bar.set_position(0);
+        merge_bar_in_progress_mode = true;
+    }
 
     let queue_snapshot = queue_metrics.as_ref().map(|metrics| metrics.snapshot());
+    let stage = merge_stage_label(
+        contig_scan_done,
+        reader_done,
+        sort_finalize_active,
+        queued_variants,
+        merged_variants,
+        written_variants,
+    );
     update_merge_progress_message(
         &merge_bar,
+        stage,
         queued_variants,
         merged_variants,
         written_variants,
@@ -244,13 +292,32 @@ pub(crate) fn run_progress_ui(
                 contig_bar.inc(1);
                 contig_bar.set_message(contig);
             }
+            ProgressEvent::ContigScanDone => {
+                contig_scan_done = true;
+                contig_bar.set_message("contig scan complete");
+                if !merge_bar_in_progress_mode && !sort_finalize_active {
+                    merge_bar.set_style(merge_progress_style());
+                    merge_bar.set_length(queued_variants);
+                    merge_bar.set_position(merged_variants.min(queued_variants));
+                    merge_bar_in_progress_mode = true;
+                }
+            }
             ProgressEvent::VariantsQueued { variants } => {
                 queued_variants += variants;
+                if merge_bar_in_progress_mode {
+                    merge_bar.set_length(queued_variants);
+                }
             }
             ProgressEvent::ReaderDone => {
                 reader_done = true;
-                merge_bar.set_style(merge_progress_style());
-                merge_bar.set_length(queued_variants);
+                if !merge_bar_in_progress_mode && !sort_finalize_active {
+                    merge_bar.set_style(merge_progress_style());
+                    merge_bar.set_length(queued_variants);
+                    merge_bar.set_position(merged_variants.min(queued_variants));
+                    merge_bar_in_progress_mode = true;
+                } else if merge_bar_in_progress_mode {
+                    merge_bar.set_length(queued_variants);
+                }
             }
             ProgressEvent::VariantsMerged { variants } => {
                 merged_variants += variants;
@@ -259,15 +326,36 @@ pub(crate) fn run_progress_ui(
                 written_variants += variants;
                 written_records += records;
             }
+            ProgressEvent::WriterSortFinalizeStart => {
+                sort_finalize_active = true;
+                merge_bar.set_style(merge_spinner_style());
+                merge_bar_in_progress_mode = false;
+            }
+            ProgressEvent::WriterSortFinalizeDone => {
+                sort_finalize_active = false;
+                merge_bar.set_style(merge_progress_style());
+                merge_bar.set_length(queued_variants);
+                merge_bar.set_position(merged_variants.min(queued_variants));
+                merge_bar_in_progress_mode = true;
+            }
         }
 
-        if reader_done {
+        if merge_bar_in_progress_mode {
             merge_bar.set_position(merged_variants.min(queued_variants));
         }
 
         let queue_snapshot = queue_metrics.as_ref().map(|metrics| metrics.snapshot());
+        let stage = merge_stage_label(
+            contig_scan_done,
+            reader_done,
+            sort_finalize_active,
+            queued_variants,
+            merged_variants,
+            written_variants,
+        );
         update_merge_progress_message(
             &merge_bar,
+            stage,
             queued_variants,
             merged_variants,
             written_variants,
@@ -276,15 +364,24 @@ pub(crate) fn run_progress_ui(
         );
     }
 
-    if !reader_done {
+    if !merge_bar_in_progress_mode {
         merge_bar.set_style(merge_progress_style());
         merge_bar.set_length(queued_variants);
         merge_bar.set_position(merged_variants.min(queued_variants));
     }
 
     let queue_snapshot = queue_metrics.as_ref().map(|metrics| metrics.snapshot());
+    let stage = merge_stage_label(
+        contig_scan_done,
+        reader_done,
+        sort_finalize_active,
+        queued_variants,
+        merged_variants,
+        written_variants,
+    );
     contig_bar.finish_with_message("done");
     merge_bar.finish_with_message(build_merge_progress_message(
+        stage,
         queued_variants,
         merged_variants,
         written_variants,

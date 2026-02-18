@@ -1,7 +1,4 @@
-use crate::core::{
-    svtype::SvType,
-    variant_block::{VariantBlock, VariantBlockResult},
-};
+use crate::core::variant_block::{VariantBlock, VariantBlockResult};
 use crossbeam_channel::Sender;
 use std::thread;
 
@@ -10,24 +7,7 @@ use super::{
     types::VariantBlob,
 };
 
-pub(crate) fn count_records_to_write(variant_block_result: &VariantBlockResult) -> usize {
-    let non_empty_group_count = variant_block_result
-        .groups
-        .iter()
-        .filter(|group| !group.is_empty())
-        .count();
-    if variant_block_result.variant_type == SvType::BND {
-        non_empty_group_count * 2
-    } else {
-        non_empty_group_count
-    }
-}
-
-pub(crate) fn count_variants_in_groups(variant_block_result: &VariantBlockResult) -> usize {
-    variant_block_result.groups.iter().map(Vec::len).sum()
-}
-
-pub(crate) fn process_blob(
+pub fn process_blob(
     variant_blob: VariantBlob,
     sender: &Sender<VariantBlockResult>,
     progress_sender: Option<&Sender<ProgressEvent>>,
@@ -37,7 +17,7 @@ pub(crate) fn process_blob(
     let current_thread = thread::current();
     let worker_name = current_thread.name().unwrap_or("unnamed");
     log::debug!(
-        "Worker [{worker_name}]: Processing blob: Contig={}, Type={}, Variants={}",
+        "Worker [{worker_name}]: Processing blob: contig={}, type={}, variants={}",
         variant_blob.contig,
         variant_blob.variant_type,
         variant_blob.variants.len()
@@ -64,14 +44,14 @@ pub(crate) fn process_blob(
     let mut variant_block = VariantBlock::new(variant_blob);
     log::debug!(
         "Worker [{worker_name}]: Starting merge for {}/{}",
-        variant_block.contig(),
-        variant_block.variant_type()
+        variant_block.contig,
+        variant_block.variant_type
     );
     variant_block.merge_block();
     log::debug!(
         "Worker [{worker_name}]: Merge complete for {}/{}, getting groups",
-        variant_block.contig(),
-        variant_block.variant_type()
+        variant_block.contig,
+        variant_block.variant_type
     );
     let variant_block_result = variant_block.get_groups();
 

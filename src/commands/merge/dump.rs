@@ -12,14 +12,14 @@ use std::{
 
 const DUMP_HEADER: &str = "record_type\tcontig\tvariant_type\tgroup_size\tgroup_count\tgroup_index\tvariant_index\tvariant_id\tvariant_vcf_id\tsample_id\tstart\tend\tsvlen\ttrid\tkd_x\tkd_y";
 
-pub(crate) type SharedDumpWriter = Arc<DumpWriter>;
+pub type SharedDumpWriter = Arc<DumpWriter>;
 
-pub(crate) struct DumpWriter {
+pub struct DumpWriter {
     writer: Mutex<BufWriter<File>>,
 }
 
 impl DumpWriter {
-    pub(crate) fn from_path(path: &Path) -> Result<Self> {
+    pub fn from_path(path: &Path) -> Result<Self> {
         let file = File::create(path).map_err(|error| {
             crate::svx_error!(
                 "Failed to create dump file at {}: {}",
@@ -35,7 +35,7 @@ impl DumpWriter {
         })
     }
 
-    pub(crate) fn dump_kd_coordinates(
+    pub fn dump_kd_coordinates(
         &self,
         contig: &str,
         variant_type: SvType,
@@ -77,7 +77,7 @@ impl DumpWriter {
         Ok(())
     }
 
-    pub(crate) fn dump_group_stats(&self, variant_block_result: &VariantBlockResult) -> Result<()> {
+    pub fn dump_group_stats(&self, variant_block_result: &VariantBlockResult) -> Result<()> {
         let contig = sanitize_tsv_field(&variant_block_result.contig);
         let variant_type = variant_block_result.variant_type.to_string();
         let mut group_size_counts: HashMap<usize, usize> = HashMap::new();
@@ -199,6 +199,7 @@ mod tests {
             .expect("KD coordinates should be dumped");
         writer
             .dump_group_stats(&VariantBlockResult {
+                blob_ordinal: 0,
                 groups: vec![vec![variant_a, variant_b], vec![]],
                 contig: "chr1".to_string(),
                 variant_type: SvType::INSERTION,

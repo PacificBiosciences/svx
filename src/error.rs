@@ -48,6 +48,12 @@ impl SvxError {
     }
 }
 
+impl From<hts_spill_sort::SpillSortError> for SvxError {
+    fn from(error: hts_spill_sort::SpillSortError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 #[macro_export]
 macro_rules! svx_error {
     ($($arg:tt)*) => {

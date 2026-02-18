@@ -1,8 +1,5 @@
 # Command-line interface of SVX
 
-This file is generated from Clap help output.
-Run `scripts/update_cli_docs.sh` after changing CLI flags/help text.
-
 ```text
 Structural variant merger
 
@@ -32,8 +29,27 @@ Output:
       --print-header
           Print only the merged header and exit
 
+      --sort-output
+          Sort output records globally by coordinate and allele key before writing
+
+      --sort-max-mem <SORT_MAX_MEM>
+          Maximum memory for sorted output buffering (supports k/m/g suffixes, decimal units)
+          
+          [default: 768M]
+
+      --sort-tmp-dir <SORT_TMP_DIR>
+          Temporary directory root for sorted output spill runs (must already exist)
+
       --no-version
           Do not append version and command line to the header
+
+      --min-supp <MIN_SUPP>
+          Minimum number of supporting samples (SUPP) required to write a merged record
+          
+          [default: 1]
+
+      --keep-monomorphic
+          Allow writing monomorphic merged records with SUPP=0
 
 Tandem repeats:
       --trs <TRS>
@@ -123,7 +139,7 @@ Selection:
           Specific positions to merge in format (contig:start[-end]) e.g., (chr1:12345),(chr2:67890-67900)
 
       --svtype <SVTYPE>
-          Restrict processing to specific SV types (comma-separated): INS, DEL, INV, DUP, BND, CNV, ALL (ALL excludes CNV)
+          Restrict processing to specific SV types (comma-separated): INS, DEL, INV, DUP, BND, CNV, ALL
           
           [default: ALL]
           [possible values: INS, DEL, INV, DUP, BND, CNV, ALL]

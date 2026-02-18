@@ -2,7 +2,7 @@
 
 <h3 align="center">Structural variation aggregation</h3>
 
-Svx is a merging tool for structural variations (SVs) and copy number variations (CNVs) called by [sawfish](https://github.com/PacificBiosciences/sawfish) from PacBio HiFi sequencing data. Svx is largely inspired by [Jasmine](https://github.com/mkirsche/Jasmine), which frames multi-sample SV merging as a graph problem and uses a modified minimum-spanning-forest strategy to merge analogous variants across samples. Svx follows the same high-level philosophy while implementing its own Rust-native merge engine and constraints. Beyond the core merge algorithm, svx includes many ergonomic features, some examples: built-in parallelization across (and within) contigs, easy run scoping by contig and region, and selection of SV classes to include in the merge.
+Svx is a merging tool for structural variations (SVs) and copy number variations (CNVs) called by [sawfish](https://github.com/PacificBiosciences/sawfish) from PacBio HiFi sequencing data. Svx is largely inspired by [Jasmine](https://github.com/mkirsche/Jasmine), which frames multi-sample SV merging as a graph problem and uses a modified minimum-spanning-forest strategy to merge analogous variants across samples. Svx follows the same high-level philosophy while implementing its own Rust-native merge engine and constraints. Beyond the core merge algorithm, svx includes many ergonomic features, a few examples: built-in parallelization across (and within) contigs, TR support, global sorting on output, easy run scoping by contig and region, and selection of SV classes to include in the merge.
 
 ## Early version warning
 
@@ -11,11 +11,10 @@ This is an **early** release of svx and is under development. Expect breaking ch
 ### Limitations
 
 - Currently **only** the [sawfish](https://github.com/PacificBiosciences/sawfish) SV/CNV calling tool is supported.
-- Currently **only** single sample VCFs are supported, as starting from single-sample VCFs preserves per-sample evidence and gives merging the most context.
 
 ## Version information
 
-Current version: **0.5.0**.
+Current version: **0.6.0**.
 
 For a complete changelog, see the [changelog](CHANGELOG.md) or the git history.
 

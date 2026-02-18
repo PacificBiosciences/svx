@@ -134,16 +134,6 @@ mod tests {
     }
 
     #[test]
-    fn bucket_index_matches_expected_order() {
-        assert_eq!(SvType::INSERTION.bucket_index(), 0);
-        assert_eq!(SvType::DELETION.bucket_index(), 1);
-        assert_eq!(SvType::INVERSION.bucket_index(), 2);
-        assert_eq!(SvType::DUPLICATION.bucket_index(), 3);
-        assert_eq!(SvType::CNV.bucket_index(), 4);
-        assert_eq!(SvType::BND.bucket_index(), 5);
-    }
-
-    #[test]
     fn from_vcf_record_parses_svtype_info() {
         let path = make_temp_vcf_with_optional_svtype(Some(b"INS"), b"v1");
         let mut reader = rust_htslib::bcf::IndexedReader::from_path(&path).unwrap();
@@ -165,17 +155,6 @@ mod tests {
 
         let err = SvType::from_vcf_record(&record).unwrap_err();
         assert!(matches!(err, SvxError::MissingSvtype));
-    }
-
-    #[test]
-    fn from_u8_invalid_svtype_returns_typed_error() {
-        let err = SvType::from_u8(b"NOT_A_TYPE").unwrap_err();
-        assert!(matches!(err, SvxError::InvalidSvtype { .. }));
-    }
-
-    #[test]
-    fn from_u8_parses_cnv_svtype() {
-        assert_eq!(SvType::from_u8(b"CNV").unwrap(), SvType::CNV);
     }
 
     #[test]

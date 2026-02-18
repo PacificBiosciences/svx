@@ -1,3 +1,4 @@
+// Default values for merge thresholds
 pub const DEFAULT_MAX_DIST_LINEAR: f32 = 0.5;
 pub const DEFAULT_USE_LINEAR_THRESHOLD: bool = true;
 pub const DEFAULT_MIN_DIST: i32 = 100; // -1 means no minimum
@@ -5,6 +6,7 @@ pub const DEFAULT_MAX_DIST: i32 = 1000;
 pub const DEFAULT_MIN_SEQUENCE_SIMILARITY: f32 = 0.8;
 pub const DEFAULT_MIN_SIZE_SIMILARITY: f64 = 0.0;
 pub const DEFAULT_KNN_SEARCH_K: usize = 4;
+pub const MAX_KNN_SEARCH_K: usize = 1024;
 pub const DEFAULT_MIN_SHARD_SIZE: usize = 0;
 pub const MAX_PIPELINE_QUEUE_CAPACITY: usize = 65_536;
 pub const DEFAULT_ALLOW_INTRASAMPLE: bool = false;
@@ -18,4 +20,9 @@ pub const DEFAULT_TR_INS_MAX_DIST: u32 = 0;
 pub const DEFAULT_TR_MAX_DIST: i32 = 4000;
 pub const DEFAULT_TR_MIN_SEQUENCE_SIMILARITY: f32 = 0.6;
 pub const DEFAULT_TR_MIN_RECIP_OVERLAP: f32 = 0.0;
+pub const DEFAULT_MIN_SUPP: usize = 1;
+pub const DEFAULT_KEEP_MONOMORPHIC: bool = false;
 pub const DISTANCE_OFFSET: f64 = 1e-9f64;
+pub const DEFAULT_SORT_MAX_MEM: usize = 768_000_000;
+pub const DEFAULT_SORT_MAX_OPEN_FILES: usize = 64;
+pub const DEFAULT_SORT_MERGE_FAN_IN: usize = 32;

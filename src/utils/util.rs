@@ -8,21 +8,23 @@ use std::{
 
 pub type Result<T> = SvxResult<T>;
 
-static INIT_LOG: Once = Once::new();
-
-pub fn init_logger() {
-    INIT_LOG.call_once(|| {
-        env_logger::builder()
-            .filter_level(log::LevelFilter::Trace)
-            .is_test(true) // Ensures that logs are output when running tests
-            .init();
-    });
-}
-
 pub const MISSING_INTEGER: i32 = i32::MIN;
 pub const VECTOR_END_INTEGER: i32 = i32::MIN + 1;
 pub const MISSING_FLOAT: f32 = f32::from_bits(0x7F80_0001);
 pub const VECTOR_END_FLOAT: f32 = f32::from_bits(0x7F80_0002);
+
+#[allow(unused)]
+static INIT_LOG: Once = Once::new();
+
+#[allow(unused)]
+pub fn init_logger() {
+    INIT_LOG.call_once(|| {
+        env_logger::builder()
+            .filter_level(log::LevelFilter::Trace)
+            .is_test(true)
+            .init();
+    });
+}
 
 pub fn handle_error_and_exit(err: impl Display) -> ! {
     log::error!("{err}");
@@ -56,13 +58,25 @@ pub fn stable_hash64(bytes: &[u8]) -> u64 {
     hash
 }
 
-pub fn hash_bytes(bytes: &[u8]) -> i32 {
-    let mut res: i64 = 0;
+pub fn stable_hash(bytes: &[u8]) -> i32 {
     const MOD: i64 = 1_000_000_007;
+    let mut res: i64 = 0;
     for &b in bytes {
         res = (res * 17 + i64::from(b)) % MOD;
     }
     res as i32
+}
+
+pub fn round_to_i64(x: f64) -> i64 {
+    (x + 0.5).floor() as i64
+}
+
+pub fn to_info_i32(value: i64, label: &str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        crate::svx_error!(
+            "Cannot write {label}={value} to INFO as i32: value is outside supported range"
+        )
+    })
 }
 
 pub fn format_number_with_commas<T>(n: T) -> String

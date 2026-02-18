@@ -1,13 +1,13 @@
 use std::fmt;
 
 #[derive(Clone, Copy)]
-pub(super) struct VariantLabel<'a> {
-    pub(super) idx: usize,
-    pub(super) id: &'a str,
+pub struct VariantLabel<'a> {
+    pub idx: usize,
+    pub id: &'a str,
 }
 
 impl<'a> VariantLabel<'a> {
-    pub(super) fn new(idx: usize, id: &'a str) -> Self {
+    pub fn new(idx: usize, id: &'a str) -> Self {
         Self { idx, id }
     }
 }

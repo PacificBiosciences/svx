@@ -12,13 +12,13 @@ use crate::{
             forest::Forest,
             kd_tree::{KnnScratch, VariantKdTree},
         },
-        variant::VariantInternal,
+        variant::{VariantInternal, VariantSource},
     },
 };
 use std::collections::{BinaryHeap, HashMap};
 
-pub(super) struct VariantMerger<'a> {
-    variants: &'a [VariantInternal],
+pub struct VariantMerger<'a, V: VariantSource> {
+    variants: &'a [V],
     tree: &'a VariantKdTree,
     forest: &'a mut Forest,
     args: &'a MergeArgsInner,
@@ -26,21 +26,22 @@ pub(super) struct VariantMerger<'a> {
     ed_aligner: WFAligner,
     id_ranks: Vec<u32>,
     knn_scratch: KnnScratch,
-    pub(super) search_state: Vec<NeighborSearchState>,
-    pub(super) heap: BinaryHeap<Edge>,
+    pub search_state: Vec<NeighborSearchState>,
+    pub heap: BinaryHeap<Edge>,
     members: Option<Vec<Vec<usize>>>,
     centroid_state: Option<CentroidState>,
-    comparison_cache: HashMap<(usize, usize), bool>, // Cache for comparison results (true=pass, false=fail)
+    comparison_cache: HashMap<(usize, usize), bool>,
 }
 
-impl<'a> VariantMerger<'a> {
-    pub(super) fn new(
-        variants: &'a [VariantInternal],
+impl<'a, V: VariantSource> VariantMerger<'a, V> {
+    pub fn new(
+        variants: &'a [V],
         tree: &'a VariantKdTree,
         forest: &'a mut Forest,
         args: &'a MergeArgsInner,
     ) -> Self {
         let n = variants.len();
+        // TODO: We do not need to use the aligner for all SVtypes, addres this
         let ed_aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryUltraLow)
             .edit()
             .build();
@@ -56,14 +57,16 @@ impl<'a> VariantMerger<'a> {
 
         let id_ranks = Self::compute_id_ranks(variants);
 
-        let mut knn_scratch = KnnScratch::new(args.knn_search_k);
+        let effective_knn_search_k = args.knn_search_k.min(n);
+        let mut knn_scratch = KnnScratch::new(effective_knn_search_k);
         let mut search_state: Vec<NeighborSearchState> = Vec::with_capacity(n);
         for variant in variants {
+            let variant = variant.as_variant();
             let mut initial_neighbors: Vec<usize> = Vec::new();
             Self::fill_neighbor_indices(
                 tree,
                 variant,
-                args.knn_search_k,
+                effective_knn_search_k,
                 &mut knn_scratch,
                 &mut initial_neighbors,
             );
@@ -91,11 +94,16 @@ impl<'a> VariantMerger<'a> {
         merger
     }
 
-    fn compute_id_ranks(variants: &[VariantInternal]) -> Vec<u32> {
+    #[inline]
+    pub fn variant(&self, idx: usize) -> &VariantInternal {
+        self.variants[idx].as_variant()
+    }
+
+    fn compute_id_ranks(variants: &[V]) -> Vec<u32> {
         let mut by_id: Vec<(usize, &str)> = variants
             .iter()
             .enumerate()
-            .map(|(idx, v)| (idx, v.id.as_str()))
+            .map(|(idx, v)| (idx, v.as_variant().id.as_str()))
             .collect();
         by_id.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -108,7 +116,7 @@ impl<'a> VariantMerger<'a> {
 
     fn initialize_heap(&mut self) {
         for i in 0..self.variants.len() {
-            let v = &self.variants[i];
+            let v = self.variant(i);
             self.heap.push(Edge::new(
                 i,
                 i,
@@ -121,7 +129,7 @@ impl<'a> VariantMerger<'a> {
         }
     }
 
-    pub(super) fn execute(&mut self) {
+    pub fn execute(&mut self) {
         let n = self.variants.len();
         if n <= 1 {
             return;
@@ -133,11 +141,13 @@ impl<'a> VariantMerger<'a> {
                 let from_id = self
                     .variants
                     .get(edge.from)
+                    .map(VariantSource::as_variant)
                     .map(|v| v.id.as_str())
                     .unwrap_or("<invalid-variant-index>");
                 let to_id = self
                     .variants
                     .get(edge.to)
+                    .map(VariantSource::as_variant)
                     .map(|v| v.id.as_str())
                     .unwrap_or("<invalid-variant-index>");
                 let from_label = VariantLabel::new(edge.from, from_id);
@@ -159,11 +169,13 @@ impl<'a> VariantMerger<'a> {
                     let from_id = self
                         .variants
                         .get(next_edge.from)
+                        .map(VariantSource::as_variant)
                         .map(|v| v.id.as_str())
                         .unwrap_or("<invalid-variant-index>");
                     let to_id = self
                         .variants
                         .get(next_edge.to)
+                        .map(VariantSource::as_variant)
                         .map(|v| v.id.as_str())
                         .unwrap_or("<invalid-variant-index>");
                     let from_label = VariantLabel::new(next_edge.from, from_id);
@@ -180,6 +192,7 @@ impl<'a> VariantMerger<'a> {
                 let from_id = self
                     .variants
                     .get(edge.from)
+                    .map(VariantSource::as_variant)
                     .map(|v| v.id.as_str())
                     .unwrap_or("<invalid-variant-index>");
                 log::trace!(

@@ -15,11 +15,18 @@ The current defaults are listed in the table below.
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
-| `--svtype` | `ALL` | Processes `INS,DEL,INV,DUP,BND` by default. CNV is opt-in via `CNV` or `ALL,CNV`. |
+| `--svtype` | `ALL` | Processes `INS,DEL,INV,DUP,BND,CNV` by default. |
 | `-t, --threads` | `1` | Number of merge worker threads. |
 | `--io-threads` | `2` | Shared HTS I/O threads for readers/writer. |
 | output destination | stdout | If `-o/--output` is omitted, output goes to stdout. |
 | output format | uncompressed VCF | Default stream format when writing to stdout. |
+| `--sort-output` | `false` | Keep input/runtime emission order unless global output sorting is explicitly enabled. |
+| `--sort-max-mem` | `768M` | Memory cap for `--sort-output` buffering before spill-to-disk. |
+| `--sort-tmp-dir` | unset | Spill files for `--sort-output` are placed under the system temp root unless set. |
+| `--sort-max-open-files` (hidden) | `64` | Advanced spill-sort tuning: maximum number of spill runs kept open before partial merges are forced. |
+| `--sort-merge-fan-in` (hidden) | `32` | Advanced spill-sort tuning for k-way merge fan-in; must be `<= --sort-max-open-files`. |
+| `--min-supp` | `1` | Minimum supporting-sample count (`SUPP`) required to write a merged record. |
+| `--keep-monomorphic` | `false` | Do not write `SUPP=0` merged records unless explicitly enabled. |
 | `--blob-queue-capacity` | derived | Default is `clamp(2 * threads, 4, 64)` unless overridden. |
 | `--result-queue-capacity` | derived | Default is `clamp(4 * threads, 8, 128)` unless overridden. |
 | `--max-dist-linear` | `0.5` | Linear factor used to compute per-variant merge radius from `abs(SVLEN)`. |
@@ -29,7 +36,7 @@ The current defaults are listed in the table below.
 | `--min-sequence-similarity` | `0.8` | Minimum insertion sequence identity for merging. |
 | `--min-size-similarity` | `0.0` | Minimum `min(abs(SVLEN_i),abs(SVLEN_j))/max(abs(SVLEN_i),abs(SVLEN_j))` required for merging. |
 | `--min-reciprocal-overlap` | `0.0` | No reciprocal-overlap requirement by default for DEL/INV/DUP. |
-| `--knn-search-k` | `4` | Number of nearest neighbors used for candidate generation. |
+| `--knn-search-k` | `4` | Number of nearest neighbors used for candidate generation (valid range: `1..=1024`). |
 | `--no-shard` | `false` | Keeps shard-based within-block parallelism enabled by default. |
 | `--min-shard-size` | `0` | Coalesce adjacent shards until size threshold is reached (`0` disables coalescing). |
 | `--allow-intrasample` | `false` | Prevents same-sample merges by default. |
@@ -102,4 +109,4 @@ If bridging/chaining is a concern, evaluate `--merge-constraint` modes in [Merge
 1. Restrict scope first (`--contig` or `--target-positions`) for faster iterations.
 2. Fix one objective per run (recall, precision, or runtime).
 3. Change one or two flags at a time.
-4. Compare support fields (`SUPP`, `SUPP_CALLS`, `SUPP_VEC`, `IDLIST`) and representative records in output.
+4. Compare support fields (`SUPP`, `SUPP_CALLS`, `IDLIST`) and representative records in output.

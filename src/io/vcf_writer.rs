@@ -14,6 +14,34 @@ pub enum OutputType {
     },
 }
 
+const CSI_MIN_SHIFT_DEFAULT: u32 = 14;
+
+type OutputIndexSpec = (&'static str, bcf::index::Type);
+
+impl OutputType {
+    fn is_uncompressed(&self) -> bool {
+        match self {
+            Self::Vcf {
+                is_uncompressed, ..
+            }
+            | Self::Bcf {
+                is_uncompressed, ..
+            } => *is_uncompressed,
+        }
+    }
+
+    fn output_index_spec(&self) -> Option<OutputIndexSpec> {
+        if self.is_uncompressed() {
+            return None;
+        }
+
+        match self {
+            Self::Vcf { .. } => Some(("tabix", bcf::index::Type::Tbx)),
+            Self::Bcf { .. } => Some(("csi", bcf::index::Type::Csi(CSI_MIN_SHIFT_DEFAULT))),
+        }
+    }
+}
+
 pub struct VcfWriter {
     pub writer: bcf::Writer,
     pub dummy_record: bcf::Record,
@@ -21,13 +49,11 @@ pub struct VcfWriter {
 }
 
 impl VcfWriter {
-    pub fn new(
-        header: &bcf::Header,
+    fn resolve_output_type(
         output_type: &Option<OutputType>,
-        output: Option<&String>,
-        io_tpool: Option<Arc<HtsThreadPool>>,
-    ) -> Result<Self> {
-        let output_type = match (output_type, output) {
+        output: Option<&str>,
+    ) -> Result<OutputType> {
+        let resolved = match (output_type, output) {
             (Some(output_type), _) => output_type.clone(),
             (None, Some(path)) => Self::infer_output_type_from_extension(path)?,
             (None, None) => OutputType::Vcf {
@@ -35,6 +61,57 @@ impl VcfWriter {
                 level: None,
             },
         };
+        Ok(resolved)
+    }
+
+    fn output_index_spec_for_target(
+        output_type: &Option<OutputType>,
+        output: Option<&str>,
+    ) -> Result<Option<OutputIndexSpec>> {
+        if output.is_none() {
+            return Ok(None);
+        }
+
+        let resolved_output_type = Self::resolve_output_type(output_type, output)?;
+        Ok(resolved_output_type.output_index_spec())
+    }
+
+    pub fn build_sorted_output_index(
+        output_type: &Option<OutputType>,
+        output: Option<&str>,
+    ) -> Result<()> {
+        let Some(path) = output else {
+            return Ok(());
+        };
+        let Some((index_name, index_type)) =
+            Self::output_index_spec_for_target(output_type, output)?
+        else {
+            return Ok(());
+        };
+
+        log::debug!(
+            "Writer: Building {} index for sorted output {}",
+            index_name,
+            path
+        );
+        bcf::index::build(path, None, 1, index_type).map_err(|error| {
+            crate::svx_error!(
+                "Failed to build {} index for sorted output {}: {}",
+                index_name,
+                path,
+                error
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn new(
+        header: &bcf::Header,
+        output_type: &Option<OutputType>,
+        output: Option<&String>,
+        io_tpool: Option<Arc<HtsThreadPool>>,
+    ) -> Result<Self> {
+        let output_type = Self::resolve_output_type(output_type, output.map(String::as_str))?;
         log::trace!("{:?}", &output_type);
 
         let mut writer = match output {
@@ -164,5 +241,27 @@ mod tests {
         assert!(writer._io_tpool.is_none());
 
         fs::remove_file(out_path).unwrap();
+    }
+
+    #[test]
+    fn output_index_spec_is_generated_for_compressed_vcf_file_output() {
+        let out_path = create_temp_path("vcf.gz");
+        let index_spec = VcfWriter::output_index_spec_for_target(&None, Some(out_path.as_str()))
+            .expect("compressed output should create index spec");
+
+        assert!(matches!(index_spec, Some(("tabix", bcf::index::Type::Tbx))));
+    }
+
+    #[test]
+    fn output_index_spec_is_none_for_uncompressed_or_stdout_output() {
+        let uncompressed_path = create_temp_path("vcf");
+        let uncompressed_spec =
+            VcfWriter::output_index_spec_for_target(&None, Some(uncompressed_path.as_str()))
+                .expect("uncompressed output should not error");
+        assert!(uncompressed_spec.is_none());
+
+        let stdout_spec = VcfWriter::output_index_spec_for_target(&None, None)
+            .expect("stdout output should not error");
+        assert!(stdout_spec.is_none());
     }
 }

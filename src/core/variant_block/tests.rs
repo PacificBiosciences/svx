@@ -3,14 +3,10 @@ use crate::cli::MergeConstraint;
 use crate::commands::merge::VariantBlob;
 use crate::core::variant::test_utils;
 use crate::io::bed_reader::TrId;
-use crate::utils::util::init_logger;
+use crate::io::vcf_reader::SampleMapping;
 use rust_htslib::bcf::Read;
 use std::collections::BinaryHeap;
 use std::{fs, time::SystemTime};
-
-fn init_test_env() {
-    init_logger();
-}
 
 fn make_temp_vcf(contents: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
@@ -67,9 +63,29 @@ pub fn create_variants(svtype: SvType) -> Vec<VariantInternal> {
 }
 
 #[test]
-fn test_variant_label_formats_index_and_id() {
-    init_test_env();
+fn variant_merger_supports_borrowed_variant_slices() {
+    let variants = vec![
+        test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
+        test_utils::from_parts(1, "v1".to_string(), SvType::INSERTION, 1.0, 0.0).unwrap(),
+    ];
 
+    let variant_refs: Vec<&VariantInternal> = variants.iter().collect();
+    let tree = VariantKdTree::new_from_refs(&variant_refs);
+    let mut forest = Forest::new_from_refs(&variant_refs, false);
+    let args = MergeArgsInner::default().with(|a| {
+        a.allow_intrasample = false;
+        a.knn_search_k = 2;
+        a.min_sequence_similarity = 0.0;
+    });
+
+    let mut merger = VariantMerger::new(&variant_refs, &tree, &mut forest, &args);
+    merger.execute();
+
+    assert_eq!(forest.find(0), forest.find(1));
+}
+
+#[test]
+fn test_variant_label_formats_index_and_id() {
     let label = VariantLabel {
         idx: 631,
         id: "some_name",
@@ -79,8 +95,6 @@ fn test_variant_label_formats_index_and_id() {
 
 #[test]
 fn test_init_schedules_self_edge_per_variant() {
-    init_test_env();
-
     let mut variants = vec![
         test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
         test_utils::from_parts(1, "v1".to_string(), SvType::INSERTION, 10.0, 10.0).unwrap(),
@@ -109,8 +123,6 @@ fn test_init_schedules_self_edge_per_variant() {
 
 #[test]
 fn test_edge_tie_break_prefers_lexicographic_id_over_index() {
-    init_test_env();
-
     let mut heap = BinaryHeap::new();
 
     // Pretend:
@@ -128,8 +140,6 @@ fn test_edge_tie_break_prefers_lexicographic_id_over_index() {
 
 #[test]
 fn test_edge_tie_break_prefers_smaller_info_hash() {
-    init_test_env();
-
     let mut heap = BinaryHeap::new();
 
     // Same distance. INFO-hash tie-break should prefer the smaller hash, regardless of indices.
@@ -142,16 +152,12 @@ fn test_edge_tie_break_prefers_smaller_info_hash() {
 
 #[test]
 fn test_edge_display_has_closing_bracket() {
-    init_test_env();
-
     let edge = Edge::new(0, 1, 2.5, 0, 0, 0, 1);
     assert_eq!(edge.to_string(), "Edge[from=0, to=1, dist=2.5]");
 }
 
 #[test]
-fn test_next_edge_emits_intrasample_candidate() {
-    init_test_env();
-
+fn test_next_edge_write_intrasample_candidate() {
     let mut variants = vec![
         test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
         test_utils::from_parts(0, "v1".to_string(), SvType::INSERTION, 1.0, 0.0).unwrap(),
@@ -180,8 +186,6 @@ fn test_next_edge_emits_intrasample_candidate() {
 
 #[test]
 fn merge_constraint_modes_handle_bridging_chain() {
-    init_test_env();
-
     // Construct a simple "bridge" / chain:
     // v0 ~ v1 and v1 ~ v2 are within max_dist, but v0 ~ v2 is not.
     //
@@ -206,6 +210,7 @@ fn merge_constraint_modes_handle_bridging_chain() {
         });
 
         let blob = VariantBlob {
+            blob_ordinal: 0,
             variants,
             contig: "chr1".to_string(),
             variant_type: SvType::INSERTION,
@@ -228,8 +233,6 @@ fn merge_constraint_modes_handle_bridging_chain() {
 
 #[test]
 fn merge_constraint_centroid_rejects_outlier_component() {
-    init_test_env();
-
     // Single-linkage can merge these via v1, but the centroid of the merged component is too far
     // from v0 given v0's max_dist.
     fn run(constraint: MergeConstraint) -> usize {
@@ -252,6 +255,7 @@ fn merge_constraint_centroid_rejects_outlier_component() {
         });
 
         let blob = VariantBlob {
+            blob_ordinal: 0,
             variants,
             contig: "chr1".to_string(),
             variant_type: SvType::INSERTION,
@@ -272,8 +276,6 @@ fn merge_constraint_centroid_rejects_outlier_component() {
 
 #[test]
 fn tr_max_dist_can_merge_variants_beyond_per_variant_max_dist() {
-    init_test_env();
-
     let variants = {
         let mut variants = vec![
             test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
@@ -298,6 +300,7 @@ fn tr_max_dist_can_merge_variants_beyond_per_variant_max_dist() {
     });
 
     let blob = VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,
@@ -314,8 +317,6 @@ fn tr_max_dist_can_merge_variants_beyond_per_variant_max_dist() {
 
 #[test]
 fn independent_shards_split_variants_with_large_start_gap() {
-    init_test_env();
-
     let variants = {
         let mut variants = vec![
             test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
@@ -336,6 +337,7 @@ fn independent_shards_split_variants_with_large_start_gap() {
     });
 
     let block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,
@@ -343,13 +345,14 @@ fn independent_shards_split_variants_with_large_start_gap() {
         dump_writer: None,
     });
 
-    assert_eq!(block.independent_shards(), vec![vec![0, 1], vec![2, 3]]);
+    assert_eq!(
+        sharding::independent_shards(&block.variants, &block.args),
+        vec![vec![0, 1], vec![2, 3]]
+    );
 }
 
 #[test]
 fn independent_shards_use_tr_max_dist_for_tr_contained_variants() {
-    init_test_env();
-
     let variants = {
         let mut variants = vec![
             test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
@@ -378,6 +381,7 @@ fn independent_shards_use_tr_max_dist_for_tr_contained_variants() {
     });
 
     let block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,
@@ -385,13 +389,14 @@ fn independent_shards_use_tr_max_dist_for_tr_contained_variants() {
         dump_writer: None,
     });
 
-    assert_eq!(block.independent_shards(), vec![vec![0, 1], vec![2]]);
+    assert_eq!(
+        sharding::independent_shards(&block.variants, &block.args),
+        vec![vec![0, 1], vec![2]]
+    );
 }
 
 #[test]
 fn min_size_similarity_blocks_symbolic_length_mismatch_merges() {
-    init_test_env();
-
     let variants = {
         let mut variants = vec![
             test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 1_000.0, 10.0).unwrap(),
@@ -410,6 +415,7 @@ fn min_size_similarity_blocks_symbolic_length_mismatch_merges() {
     });
 
     let blob = VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,
@@ -427,21 +433,19 @@ fn min_size_similarity_blocks_symbolic_length_mismatch_merges() {
 #[test]
 fn coalesce_small_shards_merges_adjacent_shards_to_minimum_size() {
     let shards = vec![vec![0], vec![1], vec![2, 3], vec![4], vec![5]];
-    let coalesced = VariantBlock::coalesce_small_shards(shards, 3);
+    let coalesced = sharding::coalesce_small_shards(shards, 3);
     assert_eq!(coalesced, vec![vec![0, 1, 2, 3, 4, 5]]);
 }
 
 #[test]
 fn coalesce_small_shards_keeps_single_small_shard_when_it_is_the_only_shard() {
     let shards = vec![vec![0, 1]];
-    let coalesced = VariantBlock::coalesce_small_shards(shards, 8);
+    let coalesced = sharding::coalesce_small_shards(shards, 8);
     assert_eq!(coalesced, vec![vec![0, 1]]);
 }
 
 #[test]
 fn coalesced_sharded_merge_matches_serial_variant_merger_groups() {
-    init_test_env();
-
     let variants = {
         let mut variants = vec![
             test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
@@ -468,6 +472,7 @@ fn coalesced_sharded_merge_matches_serial_variant_merger_groups() {
     let expected = merge_groups_with_serial_variant_merger(variants.clone(), &args);
 
     let mut block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,
@@ -475,9 +480,16 @@ fn coalesced_sharded_merge_matches_serial_variant_merger_groups() {
         dump_writer: None,
     });
 
-    assert_eq!(block.independent_shards().len(), 3);
     assert_eq!(
-        VariantBlock::coalesce_small_shards(block.independent_shards(), 4).len(),
+        sharding::independent_shards(&block.variants, &block.args).len(),
+        3
+    );
+    assert_eq!(
+        sharding::coalesce_small_shards(
+            sharding::independent_shards(&block.variants, &block.args),
+            4
+        )
+        .len(),
         1
     );
 
@@ -488,8 +500,6 @@ fn coalesced_sharded_merge_matches_serial_variant_merger_groups() {
 
 #[test]
 fn sharded_merge_matches_serial_variant_merger_groups() {
-    init_test_env();
-
     let variants = {
         let mut variants = vec![
             test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
@@ -515,6 +525,7 @@ fn sharded_merge_matches_serial_variant_merger_groups() {
     let expected = merge_groups_with_serial_variant_merger(variants.clone(), &args);
 
     let mut block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,
@@ -522,7 +533,10 @@ fn sharded_merge_matches_serial_variant_merger_groups() {
         dump_writer: None,
     });
 
-    assert_eq!(block.independent_shards().len(), 3);
+    assert_eq!(
+        sharding::independent_shards(&block.variants, &block.args).len(),
+        3
+    );
     block.merge_block();
     let actual = canonical_group_ids(block.get_groups().groups);
 
@@ -531,8 +545,6 @@ fn sharded_merge_matches_serial_variant_merger_groups() {
 
 #[test]
 fn no_shard_flag_disables_sharded_merge_path() {
-    init_test_env();
-
     let variants = {
         let mut variants = vec![
             test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
@@ -554,6 +566,7 @@ fn no_shard_flag_disables_sharded_merge_path() {
     });
 
     let block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,
@@ -561,20 +574,22 @@ fn no_shard_flag_disables_sharded_merge_path() {
         dump_writer: None,
     });
 
-    assert_eq!(block.independent_shards().len(), 2);
-    assert!(!block.should_use_sharded_merge(2));
+    assert_eq!(
+        sharding::independent_shards(&block.variants, &block.args).len(),
+        2
+    );
+    assert!(!sharding::should_use_sharded_merge(2, block.args.no_shard));
 }
 
 #[test]
 fn shard_count_log_message_reports_contig_and_shard_count() {
-    init_test_env();
-
     let variants = vec![
         test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
         test_utils::from_parts(1, "v1".to_string(), SvType::INSERTION, 50.0, 0.0).unwrap(),
     ];
 
     let block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr22".to_string(),
         variant_type: SvType::INSERTION,
@@ -582,15 +597,73 @@ fn shard_count_log_message_reports_contig_and_shard_count() {
         dump_writer: None,
     });
 
-    let message = block.shard_count_log_message(3);
+    let message = sharding::shard_count_log_message(block.variant_type, &block.contig, 3);
     assert!(message.contains("contig chr22"));
     assert!(message.contains("3 independent shards"));
 }
 
 #[test]
-fn bnd_variants_from_both_contigs_merge_in_same_graph() {
-    init_test_env();
+fn variant_block_new_defers_full_block_state_initialization() {
+    let variants = vec![
+        test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
+        test_utils::from_parts(1, "v1".to_string(), SvType::INSERTION, 10.0, 0.0).unwrap(),
+    ];
 
+    let block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
+        variants,
+        contig: "chr1".to_string(),
+        variant_type: SvType::INSERTION,
+        args: MergeArgsInner::default(),
+        dump_writer: None,
+    });
+
+    assert!(block.tree.is_none());
+    assert!(block.forest.is_none());
+}
+
+#[test]
+fn sharded_merge_path_skips_full_block_state_initialization() {
+    let variants = {
+        let mut variants = vec![
+            test_utils::from_parts(0, "v0".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap(),
+            test_utils::from_parts(1, "v1".to_string(), SvType::INSERTION, 4.0, 0.0).unwrap(),
+            test_utils::from_parts(2, "v2".to_string(), SvType::INSERTION, 100.0, 0.0).unwrap(),
+            test_utils::from_parts(3, "v3".to_string(), SvType::INSERTION, 104.0, 0.0).unwrap(),
+        ];
+        for variant in &mut variants {
+            variant.max_dist = 10.0;
+        }
+        variants
+    };
+
+    let args = MergeArgsInner::default().with(|a| {
+        a.allow_intrasample = false;
+        a.knn_search_k = 4;
+        a.min_sequence_similarity = 0.0;
+    });
+
+    let mut block = VariantBlock::new(VariantBlob {
+        blob_ordinal: 0,
+        variants,
+        contig: "chr1".to_string(),
+        variant_type: SvType::INSERTION,
+        args,
+        dump_writer: None,
+    });
+
+    assert_eq!(
+        sharding::independent_shards(&block.variants, &block.args).len(),
+        2
+    );
+    block.merge_block();
+
+    assert!(block.tree.is_none());
+    assert!(block.forest.is_none());
+}
+
+#[test]
+fn bnd_variants_from_both_contigs_merge_in_same_graph() {
     let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -616,16 +689,40 @@ chr1\t200\tbnd_b\tA\t]chr9:100]A\t.\tPASS\tSVTYPE=BND;MATEID=bnd_a\tGT:GQ:PL:AD\
     let mut it = reader.records();
     let r0 = it.next().unwrap().unwrap();
     let r1 = it.next().unwrap().unwrap();
+    let format_cache = VariantInternal::build_header_format_cache(r0.header()).unwrap();
 
-    let b0_a = VariantInternal::from_vcf_record(&r0, 0, "chr9", &args, &None).unwrap();
-    let b0_b = VariantInternal::from_vcf_record(&r1, 0, "chr1", &args, &None).unwrap();
+    let mut sample_mapping = SampleMapping::new();
+    sample_mapping.index_map.insert((0, 0), 0);
+    sample_mapping.index_map.insert((1, 0), 1);
+    sample_mapping.reverse_map.insert(0, (0, 0));
+    sample_mapping.reverse_map.insert(1, (1, 0));
+
+    let mut b0_a =
+        VariantInternal::from_vcf_record(&r0, 0, "chr9", &args, &None, &format_cache, None)
+            .unwrap();
+    let mut b0_b =
+        VariantInternal::from_vcf_record(&r1, 0, "chr1", &args, &None, &format_cache, None)
+            .unwrap();
+    b0_a.remap_support_mask_to_output(&sample_mapping, 2)
+        .unwrap();
+    b0_b.remap_support_mask_to_output(&sample_mapping, 2)
+        .unwrap();
     let event0 = VariantInternal::from_bnd_pair(b0_a, b0_b, &args).unwrap();
 
-    let b1_a = VariantInternal::from_vcf_record(&r0, 1, "chr9", &args, &None).unwrap();
-    let b1_b = VariantInternal::from_vcf_record(&r1, 1, "chr1", &args, &None).unwrap();
+    let mut b1_a =
+        VariantInternal::from_vcf_record(&r0, 1, "chr9", &args, &None, &format_cache, None)
+            .unwrap();
+    let mut b1_b =
+        VariantInternal::from_vcf_record(&r1, 1, "chr1", &args, &None, &format_cache, None)
+            .unwrap();
+    b1_a.remap_support_mask_to_output(&sample_mapping, 2)
+        .unwrap();
+    b1_b.remap_support_mask_to_output(&sample_mapping, 2)
+        .unwrap();
     let event1 = VariantInternal::from_bnd_pair(b1_a, b1_b, &args).unwrap();
 
     let variant_blob = VariantBlob {
+        blob_ordinal: 0,
         variants: vec![event0, event1],
         contig: "chr1_chr9_TRA".to_string(),
         variant_type: SvType::BND,
@@ -646,14 +743,13 @@ chr1\t200\tbnd_b\tA\t]chr9:100]A\t.\tPASS\tSVTYPE=BND;MATEID=bnd_a\tGT:GQ:PL:AD\
 #[test]
 #[ignore]
 fn test_variant_block_basic() {
-    init_logger();
-
     let variants = create_variants(SvType::INSERTION);
     let args = MergeArgsInner {
         min_recip_overlap: 0.0,
         ..Default::default()
     };
     let variant_blob = VariantBlob {
+        blob_ordinal: 0,
         variants,
         contig: "chr1".to_string(),
         variant_type: SvType::INSERTION,

@@ -13,12 +13,19 @@ io_threads = 2
 
 # Output/diagnostics/selection flags
 print_header = false
+sort_output = false
+sort_max_mem = "768M"
+# sort_tmp_dir = "/tmp"                # default: system temp root
+# sort_max_open_files = 64             # advanced tuning (hidden CLI flag)
+# sort_merge_fan_in = 32               # advanced tuning (hidden CLI flag)
 no_progress = false
 force_single = false
 no_version = false
 # contig = ["chr1", "chr2"]            # default: unset
 # target_positions = ["(chr1:1000)"]   # default: unset
 svtype = ["ALL"]
+min_supp = 1
+keep_monomorphic = false
 # dump_path = "merge_diagnostics.tsv" # default: unset
 
 # Distance thresholds

@@ -293,6 +293,24 @@ impl VariantInternal {
             .take()
             .ok_or_else(|| crate::svx_error!("BND variant {} is missing VCF write data", b.id))?;
 
+        let a_sample_gts = if let Some(format_data) = &a_vcf.format_data {
+            format_data.sample_gts.clone()
+        } else {
+            vec![a_vcf.gt.clone()]
+        };
+        let b_sample_gts = if let Some(format_data) = &b_vcf.format_data {
+            format_data.sample_gts.clone()
+        } else {
+            vec![b_vcf.gt.clone()]
+        };
+        if a_sample_gts != b_sample_gts {
+            return Err(crate::svx_error!(
+                "BND mates {} and {} have per-sample GT mismatch",
+                a.id,
+                b.id
+            ));
+        }
+
         let a_ref_base = a_vcf
             .alleles
             .first()
@@ -315,12 +333,34 @@ impl VariantInternal {
             None
         };
 
+        if a.support_calls != b.support_calls {
+            return Err(crate::svx_error!(
+                "BND mates {} and {} have inconsistent SUPP_CALLS values: {} vs {}",
+                a.id,
+                b.id,
+                a.support_calls,
+                b.support_calls
+            ));
+        }
+
         let max_dist = f64::from(args.max_dist);
         let id = format!("{}/{}", a.id, b.id);
+        let mut id_list = a.id_list.clone();
+        for source_id in &b.id_list {
+            if !id_list.contains(source_id) {
+                id_list.push(source_id.clone());
+            }
+        }
+        let mut support_mask = vec![0u64; a.support_mask.len().max(b.support_mask.len())];
+        for (word_idx, support_word) in support_mask.iter_mut().enumerate() {
+            let a_word = a.support_mask.get(word_idx).copied().unwrap_or(0);
+            let b_word = b.support_mask.get(word_idx).copied().unwrap_or(0);
+            *support_word = a_word | b_word;
+        }
 
         Ok(Self {
-            start: a_bnd.pos0 as f64,
-            end: b_bnd.pos0 as f64,
+            start: a.start,
+            end: a.end,
             interval: None,
             svlen: 0.0,
             vcf_id: a.vcf_id,
@@ -329,9 +369,17 @@ impl VariantInternal {
             max_dist,
             info_hash: a.info_hash ^ b.info_hash,
             sequence: None,
+            support_mask,
+            support_calls: a.support_calls,
             sample_id: a.sample_id,
+            start_mean: a.start_mean,
+            start_variance: a.start_variance,
+            svlen_mean: b.start_mean,
+            svlen_variance: b.start_variance,
             id,
+            id_list,
             svclaim: None,
+            svclaims: Vec::new(),
             bnd: None,
             bnd_event: Some(BndEventData {
                 a_contig: a_bnd.contig,
@@ -357,13 +405,20 @@ mod tests {
     use super::*;
     use crate::core::svtype::SvType;
     use crate::core::variant::test_utils::make_temp_vcf;
-    use crate::utils::util::init_logger;
     use rust_htslib::bcf::Read;
+
+    fn parse_variant(
+        record: &rust_htslib::bcf::Record,
+        vcf_id: usize,
+        contig: &str,
+        args: &MergeArgsInner,
+    ) -> Result<VariantInternal> {
+        let format_cache = VariantInternal::build_header_format_cache(record.header())?;
+        VariantInternal::from_vcf_record(record, vcf_id, contig, args, &None, &format_cache, None)
+    }
 
     #[test]
     fn sawfish_bnd_alt_parses_mate_pos_to_end() {
-        init_logger();
-
         let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -396,7 +451,7 @@ chr1\t717\tsawfish:0:577:0:0:0\tA\tA]chr1:149549563]\t999\tPASS\tSVTYPE=BND;MATE
         let expected_strands = [*b"--", *b"+-", *b"++", *b"-+"];
         for (idx, record) in reader.records().enumerate() {
             let record = record.unwrap();
-            let v = VariantInternal::from_vcf_record(&record, 0, "chr1", &args, &None).unwrap();
+            let v = parse_variant(&record, 0, "chr1", &args).unwrap();
             assert_eq!(v.svtype, SvType::BND);
             let bnd = v.bnd.as_ref().unwrap();
             assert_eq!(bnd.pos0, record.pos());
@@ -409,8 +464,6 @@ chr1\t717\tsawfish:0:577:0:0:0\tA\tA]chr1:149549563]\t999\tPASS\tSVTYPE=BND;MATE
 
     #[test]
     fn bnd_requires_mateid() {
-        init_logger();
-
         let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -426,14 +479,12 @@ chr1\t100\tb1\tA\t]chr9:200]A\t.\tPASS\tSVTYPE=BND\tGT\t0/1
         let record = reader.records().next().unwrap().unwrap();
         let args = MergeArgsInner::default();
 
-        let err = VariantInternal::from_vcf_record(&record, 0, "chr1", &args, &None).unwrap_err();
+        let err = parse_variant(&record, 0, "chr1", &args).unwrap_err();
         assert!(err.to_string().contains("MATEID missing in BND record"));
     }
 
     #[test]
     fn bnd_rejects_malformed_alt_even_with_chr2_and_end() {
-        init_logger();
-
         let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -452,7 +503,7 @@ chr1\t100\tb1\tA\tchr9:200\t.\tPASS\tSVTYPE=BND;CHR2=chr9;END=200;STRANDS=+-;MAT
         let record = reader.records().next().unwrap().unwrap();
         let args = MergeArgsInner::default();
 
-        let err = VariantInternal::from_vcf_record(&record, 0, "chr1", &args, &None).unwrap_err();
+        let err = parse_variant(&record, 0, "chr1", &args).unwrap_err();
         assert!(
             err.to_string().contains("BND ALT is missing '[' or ']'"),
             "unexpected error: {err}"
@@ -460,9 +511,41 @@ chr1\t100\tb1\tA\tchr9:200\t.\tPASS\tSVTYPE=BND;CHR2=chr9;END=200;STRANDS=+-;MAT
     }
 
     #[test]
-    fn bnd_pair_allows_homlen_explained_mate_pos_mismatch() {
-        init_logger();
+    fn bnd_pair_rejects_inconsistent_support_calls_between_mates() {
+        let vcf = "\
+##fileformat=VCFv4.2
+##contig=<ID=chr9>
+##contig=<ID=chr1>
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"\">
+##INFO=<ID=MATEID,Number=.,Type=String,Description=\"ID of mate breakends\">
+##INFO=<ID=SUPP_CALLS,Number=1,Type=Integer,Description=\"\">
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Genotype Quality\">
+##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"Genotype Likelihoods\">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allelic depths\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample1
+chr9\t100\tbnd_a\tA\t]chr1:200]A\t.\tPASS\tSVTYPE=BND;MATEID=bnd_b;SUPP_CALLS=2\tGT:GQ:PL:AD\t0/1:0:0,0,0:0,0
+chr1\t200\tbnd_b\tA\t]chr9:100]A\t.\tPASS\tSVTYPE=BND;MATEID=bnd_a;SUPP_CALLS=3\tGT:GQ:PL:AD\t0/1:0:0,0,0:0,0
+";
+        let path = make_temp_vcf(vcf);
+        let mut reader = bcf::Reader::from_path(&path).unwrap();
+        let mut records = reader.records();
+        let a = records.next().unwrap().unwrap();
+        let b = records.next().unwrap().unwrap();
+        let args = MergeArgsInner::default();
 
+        let bnd_a = parse_variant(&a, 0, "chr9", &args).unwrap();
+        let bnd_b = parse_variant(&b, 0, "chr1", &args).unwrap();
+
+        let err = VariantInternal::from_bnd_pair(bnd_a, bnd_b, &args).unwrap_err();
+        assert!(
+            err.to_string().contains("inconsistent SUPP_CALLS"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bnd_pair_allows_homlen_explained_mate_pos_mismatch() {
         let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -483,8 +566,8 @@ chr1\t200\tbnd_b\tA\t]chr9:105]A\t.\tPASS\tSVTYPE=BND;MATEID=bnd_a;HOMLEN=5\tGT\
         let r0 = it.next().unwrap().unwrap();
         let r1 = it.next().unwrap().unwrap();
 
-        let a = VariantInternal::from_vcf_record(&r0, 0, "chr9", &args, &None).unwrap();
-        let b = VariantInternal::from_vcf_record(&r1, 0, "chr1", &args, &None).unwrap();
+        let a = parse_variant(&r0, 0, "chr9", &args).unwrap();
+        let b = parse_variant(&r1, 0, "chr1", &args).unwrap();
         let event = VariantInternal::from_bnd_pair(a, b, &args).unwrap();
 
         let e = event.bnd_event.as_ref().unwrap();
@@ -496,8 +579,6 @@ chr1\t200\tbnd_b\tA\t]chr9:105]A\t.\tPASS\tSVTYPE=BND;MATEID=bnd_a;HOMLEN=5\tGT\
 
     #[test]
     fn bnd_coords_swap_when_contig_order_is_flipped() {
-        init_logger();
-
         let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -513,7 +594,7 @@ chr9\t100\tb1\tA\t]chr1:200]A\t.\tPASS\tSVTYPE=BND;MATEID=b2\tGT\t0/1
         let record = reader.records().next().unwrap().unwrap();
         let args = MergeArgsInner::default();
 
-        let v = VariantInternal::from_vcf_record(&record, 0, "chr9", &args, &None).unwrap();
+        let v = parse_variant(&record, 0, "chr9", &args).unwrap();
         assert_eq!(v.svtype, SvType::BND);
         assert_eq!(v.start as i64, 199);
         assert_eq!(v.end as i64, 99);
@@ -522,8 +603,6 @@ chr9\t100\tb1\tA\t]chr1:200]A\t.\tPASS\tSVTYPE=BND;MATEID=b2\tGT\t0/1
 
     #[test]
     fn bnd_coords_use_avg_fields_with_swap_semantics() {
-        init_logger();
-
         let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -541,7 +620,7 @@ chr9\t100\tb1\tA\t]chr1:200]A\t.\tPASS\tSVTYPE=BND;MATEID=b2;AVG_START=1000.0;AV
         let record = reader.records().next().unwrap().unwrap();
         let args = MergeArgsInner::default();
 
-        let v = VariantInternal::from_vcf_record(&record, 0, "chr9", &args, &None).unwrap();
+        let v = parse_variant(&record, 0, "chr9", &args).unwrap();
         assert_eq!(v.svtype, SvType::BND);
         assert_eq!(v.start, 1999.0);
         assert_eq!(v.end, 999.0);
@@ -549,8 +628,6 @@ chr9\t100\tb1\tA\t]chr1:200]A\t.\tPASS\tSVTYPE=BND;MATEID=b2;AVG_START=1000.0;AV
 
     #[test]
     fn bnd_strands_prefers_info_over_alt_inference() {
-        init_logger();
-
         let vcf = "\
 ##fileformat=VCFv4.2
 ##contig=<ID=chr1>
@@ -567,7 +644,7 @@ chr9\t100\tb1\tA\t]chr1:200]A\t.\tPASS\tSVTYPE=BND;MATEID=b2;STRANDS=+-\tGT\t0/1
         let record = reader.records().next().unwrap().unwrap();
         let args = MergeArgsInner::default();
 
-        let v = VariantInternal::from_vcf_record(&record, 0, "chr9", &args, &None).unwrap();
+        let v = parse_variant(&record, 0, "chr9", &args).unwrap();
         let bnd = v.bnd.as_ref().unwrap();
         assert_eq!(bnd.strands, *b"+-");
         assert_eq!(v.bnd_graph_id().unwrap(), "chr1_chr9_TRA_+-");

@@ -33,7 +33,7 @@ pub const FULL_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(name="svx",
           author="Tom Mokveld <tmokveld@pacificbiosciences.com>", 
           version=FULL_VERSION,
-          about="Structural variant merger",
+          about="Structural variation merging tool",
           long_about = None,
           after_help = format!("Copyright (C) 2004-{}     Pacific Biosciences of California, Inc.
           This program comes with ABSOLUTELY NO WARRANTY; it is intended for
@@ -181,6 +181,49 @@ pub struct MergeArgs {
     #[arg(long = "print-header", help_heading = "Output")]
     pub print_header: bool,
 
+    /// Sort output records globally by coordinate and allele key before writing
+    #[arg(long = "sort-output", help_heading = "Output")]
+    pub sort_output: bool,
+
+    /// Maximum memory for sorted output buffering (supports k/m/g suffixes, decimal units)
+    #[arg(
+        long = "sort-max-mem",
+        value_name = "SORT_MAX_MEM",
+        default_value = "768M",
+        value_parser = parse_sort_max_mem,
+        help_heading = "Output"
+    )]
+    pub sort_max_mem: usize,
+
+    /// Temporary directory root for sorted output spill runs (must already exist)
+    #[arg(
+        long = "sort-tmp-dir",
+        value_name = "SORT_TMP_DIR",
+        value_parser = check_existing_dir_path,
+        help_heading = "Output"
+    )]
+    pub sort_tmp_dir: Option<PathBuf>,
+
+    /// Maximum number of spill runs that may remain before partial merges are forced
+    #[arg(
+        long = "sort-max-open-files",
+        value_name = "SORT_MAX_OPEN_FILES",
+        default_value_t = DEFAULT_SORT_MAX_OPEN_FILES,
+        value_parser = positive_usize,
+        hide = true
+    )]
+    pub sort_max_open_files: usize,
+
+    /// Fan-in used for partial/final k-way merge over spill runs
+    #[arg(
+        long = "sort-merge-fan-in",
+        value_name = "SORT_MERGE_FAN_IN",
+        default_value_t = DEFAULT_SORT_MERGE_FAN_IN,
+        value_parser = positive_usize,
+        hide = true
+    )]
+    pub sort_merge_fan_in: usize,
+
     /// Force progress output (still requires interactive stderr and non-debug logging)
     #[arg(
         long = "progress",
@@ -224,7 +267,7 @@ pub struct MergeArgs {
     )]
     pub target_positions: Option<Vec<PositionTuple>>,
 
-    /// Restrict processing to specific SV types (comma-separated): INS, DEL, INV, DUP, BND, CNV, ALL (ALL excludes CNV)
+    /// Restrict processing to specific SV types (comma-separated): INS, DEL, INV, DUP, BND, CNV, ALL
     #[arg(
         long = "svtype",
         value_name = "SVTYPE",
@@ -284,7 +327,14 @@ pub enum MergeSvType {
 }
 
 impl MergeSvType {
-    const ORDERED_DEFAULT_ALL: [Self; 5] = [Self::Ins, Self::Del, Self::Inv, Self::Dup, Self::Bnd];
+    const ORDERED_DEFAULT_ALL: [Self; 6] = [
+        Self::Ins,
+        Self::Del,
+        Self::Inv,
+        Self::Dup,
+        Self::Bnd,
+        Self::Cnv,
+    ];
     const ORDERED_SELECTABLE_NON_ALL: [Self; 6] = [
         Self::Ins,
         Self::Del,
@@ -373,7 +423,8 @@ pub struct MergeArgsInner {
     #[arg(
         help_heading = "Clustering",
         long,
-        default_value_t = DEFAULT_KNN_SEARCH_K
+        default_value_t = DEFAULT_KNN_SEARCH_K,
+        value_parser = knn_search_k_in_range
     )]
     pub knn_search_k: usize,
 
@@ -404,6 +455,24 @@ pub struct MergeArgsInner {
         default_value_t = DEFAULT_ALLOW_INTRASAMPLE
     )]
     pub allow_intrasample: bool,
+
+    /// Minimum number of supporting samples (SUPP) required to write a merged record
+    #[arg(
+        help_heading = "Output",
+        long = "min-supp",
+        value_name = "MIN_SUPP",
+        default_value_t = DEFAULT_MIN_SUPP,
+        value_parser = positive_usize
+    )]
+    pub min_supp: usize,
+
+    /// Allow writing monomorphic merged records with SUPP=0
+    #[arg(
+        help_heading = "Output",
+        long = "keep-monomorphic",
+        default_value_t = DEFAULT_KEEP_MONOMORPHIC
+    )]
+    pub keep_monomorphic: bool,
 
     /// Disable mutual distance for merging
     #[arg(
@@ -514,6 +583,8 @@ impl Default for MergeArgsInner {
             no_shard: false,
             min_shard_size: DEFAULT_MIN_SHARD_SIZE,
             allow_intrasample: DEFAULT_ALLOW_INTRASAMPLE,
+            min_supp: DEFAULT_MIN_SUPP,
+            keep_monomorphic: DEFAULT_KEEP_MONOMORPHIC,
             require_mutual_distance: DEFAULT_REQUIRE_MUTUAL_DISTANCE,
             merge_constraint: MergeConstraint::None,
             min_recip_overlap: DEFAULT_MIN_RECIP_OVERLAP,
@@ -538,6 +609,11 @@ struct MergeTomlConfig {
     blob_queue_capacity: Option<usize>,
     result_queue_capacity: Option<usize>,
     print_header: Option<bool>,
+    sort_output: Option<bool>,
+    sort_max_mem: Option<SortMaxMemConfigValue>,
+    sort_tmp_dir: Option<PathBuf>,
+    sort_max_open_files: Option<usize>,
+    sort_merge_fan_in: Option<usize>,
     progress: Option<bool>,
     no_progress: Option<bool>,
     force_single: Option<bool>,
@@ -557,6 +633,8 @@ struct MergeTomlConfig {
     min_shard_size: Option<usize>,
     min_reciprocal_overlap: Option<f32>,
     allow_intrasample: Option<bool>,
+    min_supp: Option<usize>,
+    keep_monomorphic: Option<bool>,
     no_mutual_distance: Option<bool>,
     merge_constraint: Option<String>,
     filter_tr_contained: Option<bool>,
@@ -567,6 +645,24 @@ struct MergeTomlConfig {
     tr_max_dist: Option<i32>,
     tr_min_sequence_similarity: Option<f32>,
     tr_min_recip_overlap: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SortMaxMemConfigValue {
+    Integer(usize),
+    Float(f64),
+    Text(String),
+}
+
+impl SortMaxMemConfigValue {
+    fn parse_bytes(&self) -> Result<usize> {
+        match self {
+            SortMaxMemConfigValue::Integer(value) => parse_sort_max_mem(&value.to_string()),
+            SortMaxMemConfigValue::Float(value) => parse_sort_max_mem(&value.to_string()),
+            SortMaxMemConfigValue::Text(value) => parse_sort_max_mem(value),
+        }
+    }
 }
 
 impl MergeTomlConfig {
@@ -692,6 +788,43 @@ fn apply_merge_toml_config(
         merge_args.print_header = print_header;
     }
 
+    if let (false, Some(sort_output)) = (
+        is_cli_value_set(merge_matches, "sort_output"),
+        config.sort_output,
+    ) {
+        merge_args.sort_output = sort_output;
+    }
+
+    if let (false, Some(sort_max_mem)) = (
+        is_cli_value_set(merge_matches, "sort_max_mem"),
+        config.sort_max_mem,
+    ) {
+        merge_args.sort_max_mem = sort_max_mem.parse_bytes()?;
+    }
+
+    if let (false, Some(sort_tmp_dir)) = (
+        is_cli_value_set(merge_matches, "sort_tmp_dir"),
+        config.sort_tmp_dir,
+    ) {
+        let resolved = resolve_config_relative_path(config_path, sort_tmp_dir);
+        validate_existing_dir_path(&resolved)?;
+        merge_args.sort_tmp_dir = Some(resolved);
+    }
+
+    if let (false, Some(sort_max_open_files)) = (
+        is_cli_value_set(merge_matches, "sort_max_open_files"),
+        config.sort_max_open_files,
+    ) {
+        merge_args.sort_max_open_files = positive_usize(&sort_max_open_files.to_string())?;
+    }
+
+    if let (false, Some(sort_merge_fan_in)) = (
+        is_cli_value_set(merge_matches, "sort_merge_fan_in"),
+        config.sort_merge_fan_in,
+    ) {
+        merge_args.sort_merge_fan_in = positive_usize(&sort_merge_fan_in.to_string())?;
+    }
+
     if let (false, Some(progress)) = (is_cli_value_set(merge_matches, "progress"), config.progress)
     {
         merge_args.progress = progress;
@@ -790,7 +923,7 @@ fn apply_merge_toml_config(
         is_cli_value_set(merge_matches, "knn_search_k"),
         config.knn_search_k,
     ) {
-        merge_args.merge_args.knn_search_k = knn_search_k;
+        merge_args.merge_args.knn_search_k = knn_search_k_in_range(&knn_search_k.to_string())?;
     }
 
     if let (false, Some(no_shard)) = (is_cli_value_set(merge_matches, "no_shard"), config.no_shard)
@@ -817,6 +950,18 @@ fn apply_merge_toml_config(
         config.allow_intrasample,
     ) {
         merge_args.merge_args.allow_intrasample = allow_intrasample;
+    }
+
+    if let (false, Some(min_supp)) = (is_cli_value_set(merge_matches, "min_supp"), config.min_supp)
+    {
+        merge_args.merge_args.min_supp = positive_usize(&min_supp.to_string())?;
+    }
+
+    if let (false, Some(keep_monomorphic)) = (
+        is_cli_value_set(merge_matches, "keep_monomorphic"),
+        config.keep_monomorphic,
+    ) {
+        merge_args.merge_args.keep_monomorphic = keep_monomorphic;
     }
 
     if let (false, Some(no_mutual_distance)) = (
@@ -904,6 +1049,18 @@ where
     let Command::Merge(merge_args) = &mut cli.command;
     if let Some(merge_matches) = matches.subcommand_matches("merge") {
         apply_merge_toml_config(merge_args, merge_matches).map_err(|error| {
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!("{error:#}"),
+            )
+        })?;
+        validate_sort_tuning(merge_args).map_err(|error| {
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!("{error:#}"),
+            )
+        })?;
+        distinct_output_and_dump_paths(merge_args).map_err(|error| {
             clap::Error::raw(
                 clap::error::ErrorKind::ValueValidation,
                 format!("{error:#}"),
@@ -1005,6 +1162,12 @@ fn check_file_exists(s: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn check_existing_dir_path(s: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(s);
+    validate_existing_dir_path(&path)?;
+    Ok(path)
+}
+
 fn check_prefix_path(s: &str) -> Result<String> {
     let path = Path::new(s);
     validate_parent_dir_exists(path)?;
@@ -1021,6 +1184,104 @@ fn validate_parent_dir_exists(path: &Path) -> Result<()> {
     match path.parent() {
         Some(parent_dir) if !parent_dir.as_os_str().is_empty() && !parent_dir.exists() => {
             Err(anyhow!("Path does not exist: {}", parent_dir.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_existing_dir_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow!("Path does not exist: {}", path.display()));
+    }
+    if !path.is_dir() {
+        return Err(anyhow!("Path is not a directory: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn positive_usize(s: &str) -> Result<usize> {
+    let value = s
+        .parse::<usize>()
+        .map_err(|_| anyhow!("`{s}` is not a valid positive integer"))?;
+    if value == 0 {
+        return Err(anyhow!("Value must be >= 1"));
+    }
+    Ok(value)
+}
+
+fn knn_search_k_in_range(s: &str) -> Result<usize> {
+    let value = positive_usize(s)?;
+    if value > MAX_KNN_SEARCH_K {
+        return Err(anyhow!("knn_search_k must be <= {MAX_KNN_SEARCH_K}"));
+    }
+    Ok(value)
+}
+
+fn parse_sort_max_mem(value: &str) -> Result<usize> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("sort-max-mem cannot be empty"));
+    }
+
+    let (numeric, multiplier) = match trimmed.chars().last() {
+        Some(last) if last.is_ascii_alphabetic() => {
+            let unit = last.to_ascii_lowercase();
+            let multiplier = match unit {
+                'k' => 1_000_f64,
+                'm' => 1_000_000_f64,
+                'g' => 1_000_000_000_f64,
+                _ => {
+                    return Err(anyhow!(
+                        "Invalid sort-max-mem suffix `{last}`. Supported suffixes: k, m, g"
+                    ));
+                }
+            };
+            (&trimmed[..trimmed.len() - last.len_utf8()], multiplier)
+        }
+        Some(_) => (trimmed, 1_f64),
+        None => return Err(anyhow!("sort-max-mem cannot be empty")),
+    };
+
+    let numeric = numeric.trim();
+    if numeric.is_empty() {
+        return Err(anyhow!("sort-max-mem must include a numeric value"));
+    }
+
+    let parsed = numeric
+        .parse::<f64>()
+        .map_err(|_| anyhow!("`{value}` is not a valid sort-max-mem value"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(anyhow!("sort-max-mem must be > 0"));
+    }
+
+    let bytes = parsed * multiplier;
+    if !bytes.is_finite() || bytes < 1.0 || bytes > usize::MAX as f64 {
+        return Err(anyhow!(
+            "sort-max-mem `{value}` is outside the supported range"
+        ));
+    }
+
+    Ok(bytes as usize)
+}
+
+fn validate_sort_tuning(args: &MergeArgs) -> Result<()> {
+    if args.sort_merge_fan_in > args.sort_max_open_files {
+        return Err(anyhow!(
+            "sort-merge-fan-in ({}) must be <= sort-max-open-files ({})",
+            args.sort_merge_fan_in,
+            args.sort_max_open_files
+        ));
+    }
+    Ok(())
+}
+
+fn distinct_output_and_dump_paths(args: &MergeArgs) -> Result<()> {
+    match (args.output.as_deref(), args.merge_args.dump_path.as_deref()) {
+        (Some(output_path), Some(dump_path)) if Path::new(output_path) == dump_path => {
+            Err(anyhow!(
+                "The dump path and output path must be different: {}",
+                dump_path.display()
+            ))
         }
         _ => Ok(()),
     }

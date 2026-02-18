@@ -1,18 +1,23 @@
 use super::VariantMerger;
-use crate::{DISTANCE_OFFSET, cli::MergeConstraint, core::variant::VariantInternal};
+use crate::{
+    DISTANCE_OFFSET,
+    cli::MergeConstraint,
+    core::variant::{VariantInternal, VariantSource},
+};
 
-pub(super) struct CentroidState {
+pub struct CentroidState {
     sum_start: Vec<f64>,
     sum_end: Vec<f64>,
     count: Vec<usize>,
 }
 
 impl CentroidState {
-    pub(super) fn new(variants: &[VariantInternal]) -> Self {
+    pub fn new<V: VariantSource>(variants: &[V]) -> Self {
         let mut sum_start = Vec::with_capacity(variants.len());
         let mut sum_end = Vec::with_capacity(variants.len());
         let mut count = Vec::with_capacity(variants.len());
-        for v in variants {
+        for variant in variants {
+            let v = variant.as_variant();
             sum_start.push(v.start);
             sum_end.push(v.end);
             count.push(1);
@@ -25,12 +30,8 @@ impl CentroidState {
     }
 }
 
-impl VariantMerger<'_> {
-    pub(super) fn effective_max_dist_for_pair(
-        &self,
-        v1: &VariantInternal,
-        v2: &VariantInternal,
-    ) -> f64 {
+impl<V: VariantSource> VariantMerger<'_, V> {
+    pub fn effective_max_dist_for_pair(&self, v1: &VariantInternal, v2: &VariantInternal) -> f64 {
         let v1_is_tr = v1.trid.is_some();
         let v2_is_tr = v2.trid.is_some();
         if v1_is_tr && v2_is_tr && v1.trid.as_ref().unwrap().id == v2.trid.as_ref().unwrap().id {
@@ -93,9 +94,9 @@ impl VariantMerger<'_> {
             };
 
             for &i in &members[small_root] {
-                let vi = &self.variants[i];
+                let vi = self.variant(i);
                 for &j in &members[large_root] {
-                    if !self.pair_is_distance_mergeable(vi, &self.variants[j]) {
+                    if !self.pair_is_distance_mergeable(vi, self.variant(j)) {
                         return false;
                     }
                 }
@@ -139,7 +140,7 @@ impl VariantMerger<'_> {
                 .as_ref()
                 .expect("centroid merge-constraint requires membership tracking");
             for &idx in members[root_a].iter().chain(members[root_b].iter()) {
-                let v = &self.variants[idx];
+                let v = self.variant(idx);
                 let d_start = v.start - centroid_start;
                 let d_end = v.end - centroid_end;
                 let dist = (d_start * d_start + d_end * d_end).sqrt();
@@ -168,14 +169,18 @@ impl VariantMerger<'_> {
         unioned
     }
 
-    pub(super) fn try_union_with_constraint(&mut self, from: usize, to: usize) -> bool {
+    pub fn try_union_with_constraint(&mut self, from: usize, to: usize) -> bool {
         match self.merge_constraint {
             MergeConstraint::None => self.forest.try_union(from, to),
-            MergeConstraint::BboxDiameter => self.forest.try_union_with_diameter(
-                from,
-                to,
-                Some(self.effective_max_dist_for_pair(&self.variants[from], &self.variants[to])),
-            ),
+            MergeConstraint::BboxDiameter => {
+                let max_dist_for_pair = {
+                    let from_variant = self.variants[from].as_variant();
+                    let to_variant = self.variants[to].as_variant();
+                    self.effective_max_dist_for_pair(from_variant, to_variant)
+                };
+                self.forest
+                    .try_union_with_diameter(from, to, Some(max_dist_for_pair))
+            }
             MergeConstraint::Clique => self.try_union_clique(from, to),
             MergeConstraint::Centroid => self.try_union_centroid(from, to),
         }

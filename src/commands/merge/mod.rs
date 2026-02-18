@@ -4,22 +4,31 @@ use crate::{
     io::{
         bed_reader::BedMap,
         merge_reader::load_contig,
-        merge_writer::{create_output_header, write_variants},
+        merge_writer::{collect_variants, create_output_header, write_variants},
+        output_sort::{OutputSorter, SortConfig, ensure_records_sorted_for_output},
         positions_reader::positions_to_interval_trees,
         vcf_reader::VcfReaders,
         vcf_writer::VcfWriter,
     },
     utils::util::Result,
 };
+use bnd::{BndMateSelectionScope, bucket_bnd_variants, pair_bnd_breakends};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use dump::DumpWriter;
+use progress::{
+    PipelineQueueMetrics, ProgressEvent, compute_progress_enabled,
+    resolve_pipeline_queue_capacities, run_progress_ui, send_progress_event,
+};
 use rayon::{ThreadPoolBuilder, prelude::*};
+use rust_htslib::bcf;
+use shutdown::finalize_merge_threads;
 use std::{
     collections::HashSet,
     io::{self, IsTerminal},
-    path::Path,
     sync::Arc,
     thread,
 };
+use worker::process_blob;
 
 mod bnd;
 mod dump;
@@ -29,17 +38,6 @@ mod types;
 mod worker;
 
 pub use types::VariantBlob;
-
-use bnd::{
-    BndMateSelectionScope, bucket_bnd_variants, pair_bnd_breakends, pair_bnd_breakends_with_scope,
-};
-use dump::DumpWriter;
-use progress::{
-    PipelineQueueMetrics, ProgressEvent, compute_progress_enabled,
-    resolve_pipeline_queue_capacities, run_progress_ui, send_progress_event,
-};
-use shutdown::finalize_merge_threads;
-use worker::{count_records_to_write, count_variants_in_groups, process_blob};
 
 #[cfg(test)]
 mod tests;
@@ -71,18 +69,6 @@ fn get_contig_order(vcf_readers: &VcfReaders, args: &MergeArgs) -> Result<Vec<St
 }
 
 pub fn merge(args: MergeArgs) -> Result<()> {
-    let vcf_paths = args
-        .process_vcf_paths()
-        .map_err(|error| crate::svx_error!("{error}"))?;
-    let selected_svtypes = args.selected_svtypes();
-    let vcf_readers = VcfReaders::new(vcf_paths, args.num_io_threads)?;
-    if vcf_readers.readers.len() == 1 && !args.force_single {
-        return Err(crate::svx_error!(
-            "Expected two or more files to merge, got only one. Use --force-single to proceed anyway"
-        ));
-    }
-
-    let contig_order = get_contig_order(&vcf_readers, &args)?;
     let progress_enabled = compute_progress_enabled(
         args.progress,
         args.no_progress,
@@ -90,12 +76,41 @@ pub fn merge(args: MergeArgs) -> Result<()> {
         log::max_level(),
     );
 
-    // TODO: Move into reader thread
+    let vcf_paths = args
+        .process_vcf_paths()
+        .map_err(|error| crate::svx_error!("{error}"))?;
+    let vcf_readers = VcfReaders::new(vcf_paths, args.num_io_threads)?;
+    if vcf_readers.readers.len() == 1 && !args.force_single {
+        return Err(crate::svx_error!(
+            "Expected two or more files to merge, got only one. Use --force-single to proceed anyway"
+        ));
+    }
+
+    let selected_svtypes = args.selected_svtypes();
+
+    let contig_order = get_contig_order(&vcf_readers, &args)?;
+
     let bed_map = if let Some(ref bed_path) = args.tr_bed_path {
         Some(BedMap::new(bed_path)?)
     } else {
         None
     };
+
+    let dump_writer = if let Some(dump_path) = args.merge_args.dump_path.as_ref() {
+        Some(Arc::new(DumpWriter::from_path(dump_path)?))
+    } else {
+        None
+    };
+
+    let sort_output = args.sort_output;
+    let sort_config = SortConfig::new(
+        args.sort_max_mem,
+        args.sort_tmp_dir.clone(),
+        args.sort_max_open_files,
+        args.sort_merge_fan_in,
+    )?;
+    let output_type_for_index = args.output_type.clone();
+    let output_path_for_index = args.output.clone();
 
     let (out_header, sample_mapping) = create_output_header(&vcf_readers, &args)?;
     let writer_io_tpool = vcf_readers.io_tpool.clone();
@@ -106,29 +121,15 @@ pub fn merge(args: MergeArgs) -> Result<()> {
         writer_io_tpool,
     )?;
 
-    let dump_writer = if let Some(dump_path) = args.merge_args.dump_path.as_ref() {
-        if matches!(
-            args.output.as_ref(),
-            Some(output_path) if Path::new(output_path) == dump_path
-        ) {
-            return Err(crate::svx_error!(
-                "The dump path and output path must be different: {}",
-                dump_path.display()
-            ));
-        }
-
-        Some(Arc::new(DumpWriter::from_path(dump_path)?))
-    } else {
-        None
-    };
-
     if args.print_header {
         return Ok(());
     }
 
-    // TODO: This is the n of VCFs not the samples, ok for now since we enforce single sample VCFs
-    let n_samples = vcf_readers.n;
+    let n_samples = sample_mapping.index_map.len();
+    let min_supp = args.merge_args.min_supp;
+    let keep_monomorphic = args.merge_args.keep_monomorphic;
     let mut readers = vcf_readers.readers;
+    let sample_mapping_reader = sample_mapping.clone();
 
     let (blob_queue_capacity, result_queue_capacity) = resolve_pipeline_queue_capacities(
         args.num_threads,
@@ -184,6 +185,7 @@ pub fn merge(args: MergeArgs) -> Result<()> {
         };
 
         let mut all_bnd_variants: Vec<VariantInternal> = Vec::new();
+        let mut blob_ordinal: u64 = 0;
 
         log::debug!("Reader thread started.");
         for contig_name in contig_order {
@@ -193,6 +195,7 @@ pub fn merge(args: MergeArgs) -> Result<()> {
                 &selected_svtypes,
                 &bed_map,
                 &pos_map,
+                &sample_mapping_reader,
                 &mut readers,
             ) {
                 Ok(mut variants_by_type_for_contig) => {
@@ -233,14 +236,16 @@ pub fn merge(args: MergeArgs) -> Result<()> {
                             continue;
                         }
                         let blob = VariantBlob {
+                            blob_ordinal,
                             variants,
                             contig: contig_name.clone(),
                             variant_type,
                             args: args.merge_args.clone(),
                             dump_writer: dump_writer_reader.clone(),
                         };
+                        blob_ordinal = blob_ordinal.saturating_add(1);
                         log::debug!(
-                            "Reader: Sending blob for Contig={}, Type={}, Variants={}",
+                            "Reader: Sending blob for contig={}, type={}, variants={}",
                             blob.contig,
                             blob.variant_type,
                             blob.variants.len()
@@ -291,17 +296,24 @@ pub fn merge(args: MergeArgs) -> Result<()> {
                 }
             }
         }
+
+        send_progress_event(
+            progress_sender_reader.as_ref(),
+            ProgressEvent::ContigScanDone,
+        );
+
         log::debug!(
             "Reader thread finished processing all contigs. Total BNDs collected: {}",
             all_bnd_variants.len()
         );
 
         if !all_bnd_variants.is_empty() {
-            let events = if let Some(scope) = bnd_mate_selection_scope.as_ref() {
-                pair_bnd_breakends_with_scope(all_bnd_variants, &args.merge_args, Some(scope))?
-            } else {
-                pair_bnd_breakends(all_bnd_variants, &args.merge_args)?
-            };
+            let events = pair_bnd_breakends(
+                all_bnd_variants,
+                &args.merge_args,
+                bnd_mate_selection_scope.as_ref(),
+            )?;
+
             let by_graph = bucket_bnd_variants(events)?;
 
             for (graph_id, variants) in by_graph {
@@ -309,12 +321,14 @@ pub fn merge(args: MergeArgs) -> Result<()> {
                     continue;
                 }
                 let blob = VariantBlob {
+                    blob_ordinal,
                     variants,
                     contig: graph_id.clone(),
                     variant_type: SvType::BND,
                     args: args.merge_args.clone(),
                     dump_writer: dump_writer_reader.clone(),
                 };
+                blob_ordinal = blob_ordinal.saturating_add(1);
                 log::debug!(
                     "Reader: Sending BND blob for Graph={}, Variants={}",
                     blob.contig,
@@ -349,6 +363,14 @@ pub fn merge(args: MergeArgs) -> Result<()> {
     let queue_metrics_writer = Arc::clone(&queue_metrics);
     let writer_thread = thread::spawn(move || -> Result<()> {
         let mut writer_instance = writer;
+        let mut sorter = if sort_output {
+            Some(OutputSorter::new(
+                bcf::Header::from_template(writer_instance.writer.header()),
+                sort_config,
+            )?)
+        } else {
+            None
+        };
         log::debug!("Writer thread started.");
 
         for payload in result_receiver {
@@ -365,9 +387,38 @@ pub fn merge(args: MergeArgs) -> Result<()> {
                 payload.contig,
                 payload.variant_type
             );
-            let written_variants = count_variants_in_groups(&payload) as u64;
-            let written_records = count_records_to_write(&payload) as u64;
-            write_variants(payload, &sample_mapping, n_samples, &mut writer_instance)?;
+            let written_variants = payload.groups.iter().map(Vec::len).sum::<usize>() as u64;
+            let mut written_records = payload
+                .groups
+                .iter()
+                .filter(|group| !group.is_empty())
+                .count() as u64;
+            if payload.variant_type == SvType::BND {
+                written_records *= 2;
+            }
+            if let Some(sorter) = sorter.as_mut() {
+                let blob_ordinal = payload.blob_ordinal;
+                let mut records = collect_variants(
+                    payload,
+                    &sample_mapping,
+                    n_samples,
+                    min_supp,
+                    keep_monomorphic,
+                    writer_instance.writer.header(),
+                    &mut writer_instance.dummy_record,
+                )?;
+                ensure_records_sorted_for_output(&mut records)?;
+                sorter.push_blob_sorted_run(blob_ordinal, records)?;
+            } else {
+                write_variants(
+                    payload,
+                    &sample_mapping,
+                    n_samples,
+                    min_supp,
+                    keep_monomorphic,
+                    &mut writer_instance,
+                )?;
+            }
             send_progress_event(
                 progress_sender_writer.as_ref(),
                 ProgressEvent::WriterAdvanced {
@@ -375,6 +426,28 @@ pub fn merge(args: MergeArgs) -> Result<()> {
                     records: written_records,
                 },
             );
+        }
+
+        if let Some(sorter) = sorter.as_mut() {
+            send_progress_event(
+                progress_sender_writer.as_ref(),
+                ProgressEvent::WriterSortFinalizeStart,
+            );
+            log::debug!("Writer: Finalizing --sort-output at end of merge runtime");
+            sorter.finish_into(&mut writer_instance)?;
+            send_progress_event(
+                progress_sender_writer.as_ref(),
+                ProgressEvent::WriterSortFinalizeDone,
+            );
+        }
+
+        drop(writer_instance);
+
+        if sort_output {
+            VcfWriter::build_sorted_output_index(
+                &output_type_for_index,
+                output_path_for_index.as_deref(),
+            )?;
         }
 
         log::debug!("Writer thread finished.");
@@ -420,6 +493,18 @@ pub fn merge(args: MergeArgs) -> Result<()> {
         queue_snapshot.result.peak
     );
 
-    worker_result?;
-    shutdown_result
+    resolve_merge_results(worker_result, shutdown_result)
+}
+
+fn resolve_merge_results(worker_result: Result<()>, shutdown_result: Result<()>) -> Result<()> {
+    match (worker_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(worker_error), Ok(())) => Err(worker_error),
+        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(worker_error), Err(shutdown_error)) => Err(crate::svx_error!(
+            "Merge failed in worker and shutdown paths: worker error: {}; shutdown error: {}",
+            worker_error,
+            shutdown_error
+        )),
+    }
 }

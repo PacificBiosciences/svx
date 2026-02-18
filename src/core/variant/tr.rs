@@ -1,23 +1,23 @@
 use crate::core::containers::interval_tree::{Interval, IntervalTree};
 use crate::io::bed_reader::TrId;
 
-pub(super) const TR_CONTAINMENT_SCALE: u32 = 1_000_000;
+pub const TR_CONTAINMENT_SCALE: u32 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TrContainmentQuery {
+pub enum TrContainmentQuery {
     Deletion { start: u32, end: u32 },
     Insertion { pos: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct TrContainmentConfig {
+pub struct TrContainmentConfig {
     pub span_query_slop: u32,
     pub min_span_containment_scaled: u32,
     pub min_span_overlap_bp: u32,
     pub ins_max_dist: u32,
 }
 
-pub(super) fn annotate_tr_containment(
+pub fn annotate_tr_containment(
     query: TrContainmentQuery,
     tr_it: &Option<&IntervalTree<u32, TrId>>,
     cfg: TrContainmentConfig,

@@ -51,7 +51,7 @@ fn aggregate_shutdown_errors(errors: Vec<SvxError>) -> Result<()> {
     ))
 }
 
-pub(crate) fn finalize_merge_threads(
+pub fn finalize_merge_threads(
     reader_thread: thread::JoinHandle<Result<()>>,
     writer_thread: thread::JoinHandle<Result<()>>,
     progress_sender: Option<Sender<ProgressEvent>>,

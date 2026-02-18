@@ -3,18 +3,18 @@ use crate::{
     DISTANCE_OFFSET,
     core::{
         containers::kd_tree::{KnnScratch, VariantKdTree},
-        variant::VariantInternal,
+        variant::{VariantInternal, VariantSource},
         variant_block::merger::{Edge, VariantLabel},
     },
 };
 
-pub(in crate::core::variant_block) struct NeighborSearchState {
-    pub(in crate::core::variant_block) neighbors: Vec<usize>,
-    pub(in crate::core::variant_block) next_neighbor_idx: usize,
+pub struct NeighborSearchState {
+    pub neighbors: Vec<usize>,
+    pub next_neighbor_idx: usize,
 }
 
-impl VariantMerger<'_> {
-    pub(super) fn fill_neighbor_indices(
+impl<V: VariantSource> VariantMerger<'_, V> {
+    pub fn fill_neighbor_indices(
         tree: &VariantKdTree,
         variant: &VariantInternal,
         k: usize,
@@ -27,12 +27,9 @@ impl VariantMerger<'_> {
     }
 
     // Finds the next valid edge originating from `from_idx` based on its search state
-    pub(in crate::core::variant_block) fn find_next_edge_for_variant(
-        &mut self,
-        from_idx: usize,
-    ) -> Option<Edge> {
-        let from_variant = &self.variants[from_idx];
-        let from_label = VariantLabel::new(from_idx, from_variant.id.as_str());
+    pub fn find_next_edge_for_variant(&mut self, from_idx: usize) -> Option<Edge> {
+        let from_label =
+            VariantLabel::new(from_idx, self.variants[from_idx].as_variant().id.as_str());
         let require_mutual_distance = self.args.require_mutual_distance;
         let tr_max_dist = self.args.tr_max_dist;
         let state = &mut self.search_state[from_idx];
@@ -55,6 +52,7 @@ impl VariantMerger<'_> {
                     current_k,
                     next_k
                 );
+                let from_variant = self.variants[from_idx].as_variant();
                 Self::fill_neighbor_indices(
                     self.tree,
                     from_variant,
@@ -78,7 +76,8 @@ impl VariantMerger<'_> {
             let to_idx = state.neighbors[state.next_neighbor_idx];
             state.next_neighbor_idx += 1; // Consume this neighbor *before* any continue or return statements for this iteration
 
-            let candidate_to = &self.variants[to_idx];
+            let from_variant = self.variants[from_idx].as_variant();
+            let candidate_to = self.variants[to_idx].as_variant();
             let to_label = VariantLabel::new(to_idx, candidate_to.id.as_str());
             if to_idx == from_idx {
                 continue;
@@ -178,12 +177,33 @@ impl VariantMerger<'_> {
 
             // When intrasample merging is disabled, we still schedule the edge and defer
             // rejection to the union-find sample constraint (`Forest::valid_edge`).
-            if !self.args.allow_intrasample && from_variant.sample_id == candidate_to.sample_id {
+            let support_masks_overlap =
+                if !from_variant.support_mask.is_empty() || !candidate_to.support_mask.is_empty() {
+                    let max_words = from_variant
+                        .support_mask
+                        .len()
+                        .max(candidate_to.support_mask.len());
+                    (0..max_words).any(|word_idx| {
+                        let from_word = from_variant
+                            .support_mask
+                            .get(word_idx)
+                            .copied()
+                            .unwrap_or(0);
+                        let to_word = candidate_to
+                            .support_mask
+                            .get(word_idx)
+                            .copied()
+                            .unwrap_or(0);
+                        (from_word & to_word) != 0
+                    })
+                } else {
+                    from_variant.sample_id == candidate_to.sample_id
+                };
+            if !self.args.allow_intrasample && support_masks_overlap {
                 log::trace!(
-                    "Deferring intrasample rejection for edge {} -> {} (sample_id: {}); sample constraint is enforced during union.",
+                    "Deferring intrasample rejection for edge {} -> {}; sample overlap is enforced during union.",
                     from_label,
-                    to_label,
-                    from_variant.sample_id
+                    to_label
                 );
                 return Some(Edge::new(
                     from_idx,

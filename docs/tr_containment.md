@@ -31,19 +31,22 @@ Example:
 Call A: POS=100, ALT=ACGTACGT
 Call B: POS=101, ALT=CGTACGTA
 
-Direct compare:
+Direct alignment compares:
   ACGTACGT
   CGTACGTA
+  -> low similarity (phase-shifted)
 
-Observed breakpoint offset = -1
-Motif period = 4
-Tested phase shifts include ±1 and ±3
+Compute phase shift:
+  Δ = 101 - 100 = +1
+  p = 4
+  r = Δ mod p = 1
+  also test p - r = 3 (opposite rotation direction)
 
-Rotate Call B by +1:
+Rotate Call B by 1 (left rotation by r):
   CGTACGTA -> ACGTACGT
 
 Re-compare:
   ACGTACGT
   ACGTACGT
-  -> passes sequence similarity
+  -> passes --tr-min-sequence-similarity
 ```

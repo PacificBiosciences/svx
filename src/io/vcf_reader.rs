@@ -163,15 +163,14 @@ impl VcfReader {
 
         log::trace!("{:?} samples n = {}", file.file_name().unwrap(), sample_n);
 
-        if sample_n != 1 {
+        if sample_n == 0 {
             return Err(crate::svx_error!(
-                "Unsupported: VCF file {} must contain exactly 1 sample (n = {})",
+                "Unsupported: VCF file {} must contain at least 1 sample (n = {})",
                 file.display(),
                 sample_n
             ));
         }
 
-        // TODO: Create a normalized struct for variant records
         let current_record = reader.empty_record();
         log::trace!("Finished loading VCF {:?}", &file);
         Ok(VcfReader {
@@ -412,9 +411,12 @@ mod tests {
             record.set_pos(100);
             record.set_alleles(&[b"A", b"T"]).unwrap();
             if !samples.is_empty() {
-                record
-                    .push_genotypes(&[GenotypeAllele::Unphased(0), GenotypeAllele::Unphased(1)])
-                    .unwrap();
+                let mut genotypes = Vec::with_capacity(samples.len() * 2);
+                for _ in samples {
+                    genotypes.push(GenotypeAllele::Unphased(0));
+                    genotypes.push(GenotypeAllele::Unphased(1));
+                }
+                record.push_genotypes(&genotypes).unwrap();
             }
         }
 
@@ -516,6 +518,26 @@ mod tests {
                 .readers
                 .iter()
                 .all(|reader| reader._io_tpool.is_none())
+        );
+    }
+
+    #[test]
+    fn test_vcf_reader_accepts_multi_sample_input() {
+        let (_tmp, vcf_path) = create_test_vcf_path(&["sample1", "sample2"], "multi_sample");
+        let reader = VcfReader::new(vcf_path, 0, None).expect("multi-sample input should open");
+        assert_eq!(reader.sample_n, 2);
+    }
+
+    #[test]
+    fn test_vcf_reader_rejects_sites_only_input() {
+        let (_tmp, vcf_path) = create_test_vcf_path(&[], "sites_only");
+        let error = match VcfReader::new(vcf_path, 0, None) {
+            Ok(_) => panic!("sites-only VCF should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("must contain at least 1 sample"),
+            "unexpected error: {error}"
         );
     }
 

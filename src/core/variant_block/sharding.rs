@@ -23,23 +23,20 @@ fn variant_shard_reach(variant: &VariantInternal, args: &MergeArgsInner) -> f64 
     }
 }
 
-pub(super) fn independent_shards(
-    variants: &[VariantInternal],
-    args: &MergeArgsInner,
-) -> Vec<Vec<usize>> {
+pub fn independent_shards(variants: &[VariantInternal], args: &MergeArgsInner) -> Vec<Vec<usize>> {
     if variants.is_empty() {
         return Vec::new();
     }
 
-    let distance_offset = DISTANCE_OFFSET;
     let mut bounds: Vec<(usize, f64, f64)> = variants
         .iter()
         .enumerate()
         .map(|(idx, variant)| {
-            let reach = variant_shard_reach(variant, args) + distance_offset;
+            let reach = variant_shard_reach(variant, args) + DISTANCE_OFFSET;
             (idx, variant.start - reach, variant.start + reach)
         })
         .collect();
+
     bounds.sort_by(|a, b| {
         a.1.total_cmp(&b.1)
             .then_with(|| a.2.total_cmp(&b.2))
@@ -76,7 +73,7 @@ pub(super) fn independent_shards(
     shards
 }
 
-pub(super) fn coalesce_small_shards(
+pub fn coalesce_small_shards(
     mut shards: Vec<Vec<usize>>,
     min_shard_size: usize,
 ) -> Vec<Vec<usize>> {
@@ -86,7 +83,6 @@ pub(super) fn coalesce_small_shards(
 
     let mut coalesced: Vec<Vec<usize>> = Vec::with_capacity(shards.len());
     let mut pending: Vec<usize> = Vec::new();
-
     for mut shard in shards.drain(..) {
         if pending.is_empty() && shard.len() >= min_shard_size {
             coalesced.push(shard);
@@ -113,57 +109,6 @@ pub(super) fn coalesce_small_shards(
     coalesced
 }
 
-pub(super) fn shard_size_stats_log_message(
-    variant_type: SvType,
-    contig: &str,
-    min_shard_size: usize,
-    label: &str,
-    shards: &[Vec<usize>],
-) -> Option<String> {
-    if shards.is_empty() {
-        return None;
-    }
-
-    let mut shard_sizes: Vec<usize> = shards.iter().map(Vec::len).collect();
-    shard_sizes.sort_unstable();
-    let n_shards = shard_sizes.len();
-    let total_variants: usize = shard_sizes.iter().sum();
-    let min_size = shard_sizes[0];
-    let p50_size = shard_sizes[(n_shards - 1) / 2];
-    let p90_size = shard_sizes[((n_shards - 1) * 9) / 10];
-    let max_size = shard_sizes[n_shards - 1];
-    let singletons = shard_sizes.iter().filter(|&&size| size == 1).count();
-
-    let small_summary = if min_shard_size > 1 {
-        let n_small = shard_sizes
-            .iter()
-            .filter(|&&size| size < min_shard_size)
-            .count();
-        format!(
-            ", lt_{}={}",
-            format_number_with_commas(min_shard_size),
-            format_number_with_commas(n_small)
-        )
-    } else {
-        String::new()
-    };
-
-    Some(format!(
-        "Merge: {} shard size stats ({}) on contig {}: shards={}, variants={}, min={}, p50={}, p90={}, max={}, singletons={}{}",
-        variant_type,
-        label,
-        contig,
-        format_number_with_commas(n_shards),
-        format_number_with_commas(total_variants),
-        format_number_with_commas(min_size),
-        format_number_with_commas(p50_size),
-        format_number_with_commas(p90_size),
-        format_number_with_commas(max_size),
-        format_number_with_commas(singletons),
-        small_summary
-    ))
-}
-
 fn collect_groups_for_shard(shard_indices: &[usize], forest: &mut Forest) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); shard_indices.len()];
     for (local_idx, &global_idx) in shard_indices.iter().enumerate() {
@@ -185,16 +130,13 @@ fn merge_single_shard(
     variants: &[VariantInternal],
     args: &MergeArgsInner,
 ) -> ShardMergeResult {
-    let mut shard_variants: Vec<VariantInternal> = shard_indices
+    let shard_variants: Vec<&VariantInternal> = shard_indices
         .iter()
-        .map(|&global_idx| variants[global_idx].clone())
+        .map(|&global_idx| &variants[global_idx])
         .collect();
-    for (local_idx, variant) in shard_variants.iter_mut().enumerate() {
-        variant.index = local_idx;
-    }
 
-    let tree = VariantKdTree::new(&shard_variants);
-    let mut forest = Forest::new(&shard_variants, args.allow_intrasample);
+    let tree = VariantKdTree::new_from_refs(&shard_variants);
+    let mut forest = Forest::new_from_refs(&shard_variants, args.allow_intrasample);
 
     let mut merger = VariantMerger::new(&shard_variants, &tree, &mut forest, args);
     merger.execute();
@@ -204,43 +146,31 @@ fn merge_single_shard(
     ShardMergeResult { groups }
 }
 
-pub(super) fn merge_independent_shards(
-    forest: &mut Forest,
+pub fn merge_independent_shards(
     variants: &[VariantInternal],
     args: &MergeArgsInner,
     shards: Vec<Vec<usize>>,
-) {
+) -> Vec<Vec<usize>> {
     let shard_results: Vec<ShardMergeResult> = shards
         .par_iter()
         .map(|shard_indices| merge_single_shard(shard_indices, variants, args))
         .collect();
 
-    for shard_result in shard_results {
-        for group in shard_result.groups {
-            if let Some((&anchor, rest)) = group.split_first() {
-                for &idx in rest {
-                    forest.union_unchecked(anchor, idx);
-                }
-            }
-        }
-    }
+    shard_results
+        .into_iter()
+        .flat_map(|shard_result| shard_result.groups)
+        .collect()
 }
 
-pub(super) fn should_use_sharded_merge(shard_count: usize, no_shard: bool) -> bool {
+pub fn should_use_sharded_merge(shard_count: usize, no_shard: bool) -> bool {
     shard_count > 1 && !no_shard
 }
 
-pub(super) fn shard_count_log_message(
-    variant_type: SvType,
-    contig: &str,
-    shard_count: usize,
-) -> String {
-    let shard_label = if shard_count == 1 { "shard" } else { "shards" };
+pub fn shard_count_log_message(variant_type: SvType, contig: &str, shard_count: usize) -> String {
     format!(
-        "Merge: {} block for contig {} split into {} independent {}",
+        "Merge: {} block for contig {} split into {} independent shards",
         variant_type,
         contig,
         format_number_with_commas(shard_count),
-        shard_label
     )
 }

@@ -17,6 +17,8 @@ no_version = false
 # contig = ["chr1", "chr2"]           
 # target_positions = ["(chr1:1000)"] 
 svtype = ["ALL"]
+min_supp = 1
+keep_monomorphic = false
 # dump_path = "merge_diagnostics.tsv"
 
 # Distance thresholds

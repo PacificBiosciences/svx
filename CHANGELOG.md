@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.0
+
+### Highlights
+
+- Added multi-sample VCF support for merge inputs
+  - Enables incremental merging workflows and merging joint-called multi-sample sawfish output
+  - Multi-sample records are treated as atomic records during merging and are not split into per-sample records
+  - For better consistency, prefer using one-shot merging over incremental merging to reduce precision drift and preserve full variant context during merging
+- Added optional global output sorting with `--sort-output`
+  - Added automatic indexing for sorted compressed outputs (`.tbi` for VCF, `.csi` for BCF)
+  - Sorting failures are hard errors (no fallback to unsorted output), and `--sort-tmp-dir` must exist (if unspecified will use system defaults)
+- Added output support controls `--min-supp` and `--keep-monomorphic`
+- Improved performance and internals across sharded merging, parse/write caching, lazy initialization, and shard/sorter refactors
+
+### Important behavior changes
+
+- CNVs are now always included (part of `--svtype ALL`)
+  
+### Output updates
+
+- Legacy aggregate INFO stats (`START_AVG`, `START_VARIANCE`, `SVLEN_AVG`, `SVLEN_VARIANCE`, `SUPP_VEC`) are no longer written
+  - Output uncertainty fields now use `CIPOS` / `CIEND`
+
 ## 0.5.0
 
 **Major** update and refactor of svx with improved clustering and better parametrization, performance and reliability optimizations, added BND and CNV support, improved TR logic, and expanded documentation.

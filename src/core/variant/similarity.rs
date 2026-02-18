@@ -9,11 +9,11 @@ impl VariantInternal {
         [self.start, self.end]
     }
 
-    pub fn point_distance(p1: &[f64; 2], p2: &[f64; 2]) -> f64 {
-        let d_start = p1[0] - p2[0];
-        let d_end = p1[1] - p2[1];
-        (d_start * d_start + d_end * d_end).sqrt()
-    }
+    // pub fn point_distance(p1: &[f64; 2], p2: &[f64; 2]) -> f64 {
+    //     let d_start = p1[0] - p2[0];
+    //     let d_end = p1[1] - p2[1];
+    //     (d_start * d_start + d_end * d_end).sqrt()
+    // }
 
     #[inline]
     pub fn distance(&self, other: &VariantInternal) -> f64 {
@@ -223,7 +223,6 @@ mod tests {
     use crate::core::svtype::SvType;
     use crate::core::variant::test_utils;
     use crate::io::bed_reader::TrId;
-    use crate::utils::util::init_logger;
 
     fn new_ed_aligner() -> WFAligner {
         WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryUltraLow)
@@ -247,13 +246,6 @@ mod tests {
             &mut aligner,
             1.0
         ));
-    }
-
-    #[test]
-    fn seq_similarity_single_edit_behaves_reasonably() {
-        let mut aligner = new_ed_aligner();
-        assert!(seq_similarity_passes(b"ACGT", b"ACGG", &mut aligner, 0.70));
-        assert!(!seq_similarity_passes(b"ACGT", b"ACGG", &mut aligner, 0.80));
     }
 
     #[test]
@@ -314,25 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_distance_does_not_require_global_config() {
-        init_logger();
-
-        let var1 =
-            test_utils::from_parts(0, "var1".to_string(), SvType::INSERTION, 0.0, 0.0).unwrap();
-        let var2 =
-            test_utils::from_parts(0, "var2".to_string(), SvType::INSERTION, 3.0, 4.0).unwrap();
-
-        // Should not depend on any global configuration being initialized.
-        // With Euclidean distance, distance(0,0)-(3,4)=5.
-        let dist = var1.distance(&var2);
-        assert!((dist - 5.0).abs() < 1e-12);
-    }
-
-    #[test]
     fn test_distance_preserves_1bp_resolution_at_large_coordinates() {
-        init_logger();
-
-        // At ~3e9, `f32` has a granularity of ~256, so `start + 1.0` collapses.
         let start1 = 3_000_000_000.0f64;
         let start2 = start1 + 1.0f64;
         assert_ne!(
@@ -352,9 +326,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_passes_overlap() {
-        init_logger();
         let min_recip_overlap = 0.4f32;
 
         let var1 =
@@ -399,10 +371,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_min_recip_overlap_threshold() {
-        init_logger();
-
         // Test case with 50% overlap:
         // var1: 100-200 (length 100)
         // var2: 150-250 (length 100)

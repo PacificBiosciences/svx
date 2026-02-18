@@ -1,10 +1,10 @@
 use std::{cmp::Ordering, fmt};
 
 #[derive(Debug)]
-pub(super) struct Edge {
-    pub(super) from: usize,
-    pub(super) to: usize,
-    pub(super) dist: f64,
+pub struct Edge {
+    pub from: usize,
+    pub to: usize,
+    pub dist: f64,
     dist_key: i64,
     from_info_hash: i32,
     to_info_hash: i32,
@@ -27,7 +27,7 @@ impl Edge {
         }
     }
 
-    pub(super) fn new(
+    pub fn new(
         from: usize,
         to: usize,
         dist: f64,

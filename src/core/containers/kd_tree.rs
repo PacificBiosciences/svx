@@ -1,4 +1,4 @@
-use crate::core::variant::VariantInternal;
+use crate::core::variant::{VariantInternal, VariantSource};
 
 const K: usize = 2;
 
@@ -138,10 +138,19 @@ mod kdtree_impl {
 
     impl VariantKdTree {
         pub fn new(variants: &[VariantInternal]) -> Self {
+            Self::new_from_slice(variants)
+        }
+
+        pub fn new_from_refs(variants: &[&VariantInternal]) -> Self {
+            Self::new_from_slice(variants)
+        }
+
+        fn new_from_slice<V: VariantSource>(variants: &[V]) -> Self {
+            let variant_count = variants.len();
             assert!(
-                variants.len() <= (LEAF_TAG - 1) as usize,
+                variant_count <= (LEAF_TAG - 1) as usize,
                 "Variant count {} exceeds SVX KD-tree index capacity (u32, leaf-tagged)",
-                variants.len()
+                variant_count
             );
 
             let (xs, ys) = Self::coords_from_variants(variants);
@@ -176,10 +185,11 @@ mod kdtree_impl {
             }
         }
 
-        fn coords_from_variants(variants: &[VariantInternal]) -> (Vec<f64>, Vec<f64>) {
+        fn coords_from_variants<V: VariantSource>(variants: &[V]) -> (Vec<f64>, Vec<f64>) {
             let mut xs: Vec<f64> = Vec::with_capacity(variants.len());
             let mut ys: Vec<f64> = Vec::with_capacity(variants.len());
-            for v in variants {
+            for variant_source in variants {
+                let v = variant_source.as_variant();
                 let p = v.point();
                 assert!(
                     p[0].is_finite() && p[1].is_finite(),
@@ -503,6 +513,23 @@ mod tests {
         let query =
             test_utils::from_parts(0, "q".to_string(), SvType::INSERTION, 12.0, 5.0).unwrap();
         assert!(tree.knn(&query, 0).is_empty());
+    }
+
+    #[test]
+    fn new_from_refs_matches_owned_knn_results() {
+        let variants = vec![
+            test_utils::from_parts(0, "0".to_string(), SvType::INSERTION, 10.0, 5.0).unwrap(),
+            test_utils::from_parts(0, "1".to_string(), SvType::INSERTION, 12.0, 7.0).unwrap(),
+            test_utils::from_parts(1, "2".to_string(), SvType::INSERTION, 22.0, 9.0).unwrap(),
+            test_utils::from_parts(1, "3".to_string(), SvType::INSERTION, 40.0, 12.0).unwrap(),
+        ];
+        let refs: Vec<&VariantInternal> = variants.iter().collect();
+
+        let owned_tree = VariantKdTree::new(&variants);
+        let ref_tree = VariantKdTree::new_from_refs(&refs);
+        let query = variants[1].clone();
+
+        assert_eq!(owned_tree.knn(&query, 4), ref_tree.knn(&query, 4));
     }
 
     #[test]

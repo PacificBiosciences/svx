@@ -1,4 +1,7 @@
-use crate::{DISTANCE_OFFSET, core::variant::VariantInternal};
+use crate::{
+    DISTANCE_OFFSET,
+    core::variant::{VariantInternal, VariantSource},
+};
 use std::mem;
 
 // Each component may require multiple 64-bit integers to hold its bitset of sample IDs if there are many samples
@@ -21,23 +24,52 @@ pub struct Forest {
 
 impl Forest {
     pub fn new(variants: &[VariantInternal], allow_intrasample: bool) -> Self {
-        let n = variants.len();
-        let max_sample = variants.iter().map(|v| v.sample_id).max().unwrap_or(0);
-        let mask_words = if n == 0 {
+        Self::new_from_slice(variants, allow_intrasample)
+    }
+
+    pub fn new_from_refs(variants: &[&VariantInternal], allow_intrasample: bool) -> Self {
+        Self::new_from_slice(variants, allow_intrasample)
+    }
+
+    fn new_from_slice<V: VariantSource>(variants: &[V], allow_intrasample: bool) -> Self {
+        let variant_count = variants.len();
+        let max_mask_words = (0..variant_count)
+            .map(|idx| variants[idx].as_variant().support_mask.len())
+            .max()
+            .unwrap_or(0);
+        let mask_words = if variant_count == 0 {
             0
+        } else if max_mask_words > 0 {
+            max_mask_words
         } else {
+            let max_sample = (0..variant_count)
+                .map(|idx| variants[idx].as_variant().sample_id)
+                .max()
+                .unwrap_or(0);
             max_sample / SAMPLES_PER_MASK + 1
         };
-        let parent = vec![-1; n];
-        let mut sample_masks = vec![0u64; n * mask_words];
-        let mut min_start = vec![0.0; n];
-        let mut max_start = vec![0.0; n];
-        let mut min_end = vec![0.0; n];
-        let mut max_end = vec![0.0; n];
-        for (i, variant) in variants.iter().enumerate() {
-            let mask_id = variant.sample_id / SAMPLES_PER_MASK;
-            let bit_position = variant.sample_id % SAMPLES_PER_MASK;
-            sample_masks[i * mask_words + mask_id] |= 1u64 << bit_position;
+        let parent = vec![-1; variant_count];
+        let mut sample_masks = vec![0u64; variant_count * mask_words];
+        let mut min_start = vec![0.0; variant_count];
+        let mut max_start = vec![0.0; variant_count];
+        let mut min_end = vec![0.0; variant_count];
+        let mut max_end = vec![0.0; variant_count];
+        for (i, variant_source) in variants.iter().enumerate() {
+            let variant = variant_source.as_variant();
+            let row_offset = i * mask_words;
+            if !variant.support_mask.is_empty() {
+                for (word_idx, support_word) in variant.support_mask.iter().copied().enumerate() {
+                    if word_idx < mask_words {
+                        sample_masks[row_offset + word_idx] |= support_word;
+                    }
+                }
+            } else {
+                let mask_id = variant.sample_id / SAMPLES_PER_MASK;
+                let bit_position = variant.sample_id % SAMPLES_PER_MASK;
+                if mask_id < mask_words {
+                    sample_masks[row_offset + mask_id] |= 1u64 << bit_position;
+                }
+            }
 
             min_start[i] = variant.start;
             max_start[i] = variant.start;
@@ -383,7 +415,7 @@ mod tests {
                 expected_masks[root * mask_words + mask_id] |= 1u64 << bit_position;
             }
 
-            // Roots store negative size; sample masks are only guaranteed to be current at roots.
+            // Roots store negative size, sample masks are only guaranteed to be current at roots.
             for (i, parent) in f.parent.iter().enumerate() {
                 if *parent < 0 {
                     prop_assert_eq!((-*parent) as usize, counts[i]);
@@ -493,6 +525,24 @@ mod tests {
         assert_eq!(f.sample_masks[7 * expected_mask_words], 0b100);
         assert_eq!(f.sample_masks[11 * expected_mask_words], 0b1000);
         assert_eq!(f.sample_masks[12 * expected_mask_words], 0b10000);
+    }
+
+    #[test]
+    fn new_from_refs_matches_owned_constructor() {
+        let variants = create_variants();
+        let refs: Vec<&VariantInternal> = variants.iter().collect();
+
+        let owned = Forest::new(&variants, false);
+        let from_refs = Forest::new_from_refs(&refs, false);
+
+        assert_eq!(owned.parent, from_refs.parent);
+        assert_eq!(owned.sample_masks, from_refs.sample_masks);
+        assert_eq!(owned.mask_words, from_refs.mask_words);
+        assert_eq!(owned.min_start, from_refs.min_start);
+        assert_eq!(owned.max_start, from_refs.max_start);
+        assert_eq!(owned.min_end, from_refs.min_end);
+        assert_eq!(owned.max_end, from_refs.max_end);
+        assert_eq!(owned.allow_intrasample, from_refs.allow_intrasample);
     }
 
     #[test]
@@ -698,5 +748,21 @@ mod tests {
             !f_allow_false.can_union(0, 1),
             "Should NOT be able to union variants from the same sample when allow_intrasample is false"
         );
+    }
+
+    #[test]
+    fn support_mask_overlap_blocks_union_when_intrasample_is_disabled() {
+        let mut first =
+            test_utils::from_parts(0, "var0".to_string(), SvType::INSERTION, 1.0, 1.0).unwrap();
+        let mut second =
+            test_utils::from_parts(5, "var1".to_string(), SvType::INSERTION, 2.0, 2.0).unwrap();
+        first.support_mask = vec![0b0011];
+        second.support_mask = vec![0b0010];
+
+        let mut blocked = Forest::new(&[first.clone(), second.clone()], false);
+        assert!(!blocked.can_union(0, 1));
+
+        let mut allowed = Forest::new(&[first, second], true);
+        assert!(allowed.can_union(0, 1));
     }
 }

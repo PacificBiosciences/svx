@@ -1,6 +1,6 @@
 [package]
 name = "svx"
-version = "0.5.0"
+version = "0.6.0"
 build = "build.rs"
 authors = ["Tom Mokveld <tmokveld@pacificbioscience.com"]
 description = """
@@ -9,18 +9,23 @@ svx is a tool for structural variant merging.
 license-file = "LICENSE.md"
 edition = "2024"
 
+[workspace]
+members = [".", "crates/hts-spill-sort"]
+resolver = "2"
 
 [build-dependencies]
 vergen-gitcl = { version = "1", features = ["build"] }
 
 [dev-dependencies]
-kiddo = "5.2"
 proptest = "1"
 rand = "0.9"
 tempdir = "0.3"
-tempfile = "3"
+
+[features]
+default = []
 
 [[bin]]
+bench = false
 path = "src/main.rs"
 name = "svx"
 
@@ -28,7 +33,6 @@ name = "svx"
 clap = { version = "4.5", features = ["suggestions", "derive"] }
 wfa2-sys = { version = "0.1.0", git = "https://github.com/ctsa/rust-wfa2.git", rev = "4342b3b06278656fa51c0a33b4eb0b67d53bfa8c" }
 rust-htslib = { version = "0.49", default-features = false }
-bio = { version = "3", optional = true }
 log = "0.4"
 env_logger = "0.11"
 owo-colors = { version = "4.2", features = ["supports-colors"] }
@@ -42,6 +46,8 @@ rayon = "1.10"
 indicatif = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
+tempfile = "3"
+hts-spill-sort = { path = "crates/hts-spill-sort" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { version = "0.2" }

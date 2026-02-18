@@ -9,7 +9,7 @@ use std::{
 
 static TEMP_VCF_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn make_temp_vcf(contents: &str) -> std::path::PathBuf {
+pub fn make_temp_vcf(contents: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -21,7 +21,7 @@ pub(super) fn make_temp_vcf(contents: &str) -> std::path::PathBuf {
     path
 }
 
-pub(crate) fn from_parts(
+pub fn from_parts(
     vcf_id: usize,
     id: String,
     svtype: SvType,
@@ -35,16 +35,32 @@ pub(crate) fn from_parts(
         _ => None,
     };
 
+    let id_list = vec![id.clone()];
+
     Ok(VariantInternal {
         start,
         end,
         interval,
         svlen: end,
         vcf_id,
+        support_mask: {
+            let word = vcf_id / (u64::BITS as usize);
+            let bit = vcf_id % (u64::BITS as usize);
+            let mut mask = vec![0u64; word + 1];
+            mask[word] |= 1u64 << bit;
+            mask
+        },
+        support_calls: 1,
         sample_id: vcf_id,
+        start_mean: start + 1.0,
+        start_variance: 0.0,
+        svlen_mean: end,
+        svlen_variance: 0.0,
         svtype,
         id,
+        id_list,
         svclaim: None,
+        svclaims: Vec::new(),
         bnd: None,
         bnd_event: None,
         index: 0,
@@ -56,7 +72,7 @@ pub(crate) fn from_parts(
     })
 }
 
-pub(crate) fn insertion_fixture_variants(svtype: SvType) -> Vec<VariantInternal> {
+pub fn insertion_fixture_variants(svtype: SvType) -> Vec<VariantInternal> {
     vec![
         from_parts(0, "var1".to_string(), svtype, 10.0, 5.0).expect("var1 should build"),
         from_parts(0, "var2".to_string(), svtype, 1.0, 5.0).expect("var2 should build"),
@@ -74,7 +90,7 @@ pub(crate) fn insertion_fixture_variants(svtype: SvType) -> Vec<VariantInternal>
     ]
 }
 
-pub(crate) fn insertion_fixture_variants_disjoint(svtype: SvType) -> Vec<VariantInternal> {
+pub fn insertion_fixture_variants_disjoint(svtype: SvType) -> Vec<VariantInternal> {
     vec![
         from_parts(0, "var1".to_string(), svtype, 10.0, 5.0).expect("var1 should build"),
         from_parts(1, "var2".to_string(), svtype, 1.0, 5.0).expect("var2 should build"),
